@@ -1,0 +1,314 @@
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: llama3-70b-8tpu
+  namespace: default
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 2
+    restartPolicy: RecreateGroupOnPodRestart
+
+    # ── LEADER ───────────────────────────────────────────────────
+    leaderTemplate:
+      metadata:
+        labels:
+          app: llama3-8tpu
+          role: leader
+      spec:
+        subdomain: llama3-70b-8tpu
+        nodeSelector:
+          cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+          cloud.google.com/gke-tpu-topology: 2x4
+        tolerations:
+        - key: "google.com/tpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+        volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: "150Gi"
+        - name: hf-cache
+          emptyDir:
+            sizeLimit: "120Gi"
+        - name: entrypoint
+          configMap:
+            name: jetstream-entrypoint
+            defaultMode: 0755
+        containers:
+
+        # ── Container 1: JetStream Engine ────────────────────────
+        - name: jetstream-leader
+          image: us-docker.pkg.dev/cloud-tpu-images/inference/jetstream-pytorch-server:v0.2.4
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+          - mountPath: /dev/shm
+            name: dshm
+          - mountPath: /root/.cache/huggingface
+            name: hf-cache
+          - mountPath: /entrypoint
+            name: entrypoint
+          command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            POD_IP=$(hostname -i | awk '{print $1}')
+            echo "=============================================="
+            echo "LEADER: JAX Multihost JetStream"
+            echo "Pod IP     : ${POD_IP}"
+            echo "Hostname   : $(hostname)"
+            echo "Coordinator: ${POD_IP}:1234"
+            echo "=============================================="
+            python3 /entrypoint/run_multihost.py \
+              --model_id=meta-llama/Llama-3.1-70B-Instruct \
+              --hf_token="${HF_TOKEN}" \
+              --port=9000 \
+              --override_batch_size=8 \
+              --max_input_length=2048 \
+              --max_output_length=1024 \
+              --coordinator_address="${POD_IP}:1234" \
+              --num_processes=2 \
+              --process_id=0
+          ports:
+          - name: grpc
+            containerPort: 9000
+          - name: jax-coord
+            containerPort: 1234
+          resources:
+            requests:
+              cpu: "8"
+              memory: "64Gi"
+            limits:
+              google.com/tpu: "4"
+          env:
+          - name: HF_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: hf-token
+                key: HF_TOKEN
+          - name: HUGGING_FACE_HUB_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: hf-token
+                key: HF_TOKEN
+          - name: JAX_PLATFORMS
+            value: "tpu"
+          - name: TF_CPP_MIN_LOG_LEVEL
+            value: "0"
+          readinessProbe:
+            tcpSocket:
+              port: 9000
+            initialDelaySeconds: 480
+            periodSeconds: 30
+            failureThreshold: 30
+            timeoutSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: 9000
+            initialDelaySeconds: 600
+            periodSeconds: 60
+            failureThreshold: 5
+            timeoutSeconds: 10
+
+        # ── Container 2: OpenAI HTTP Proxy ────────────────────────
+        - name: openai-proxy
+          image: us-docker.pkg.dev/cloud-tpu-images/inference/jetstream-http:v0.2.3
+          imagePullPolicy: IfNotPresent
+          command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            echo "==> Proxy: waiting for JetStream gRPC on localhost:9000..."
+            until python3 -c "
+            import socket, sys
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(3)
+            r = s.connect_ex(('127.0.0.1', 9000))
+            s.close()
+            sys.exit(0 if r == 0 else 1)
+            " 2>/dev/null; do
+              echo "    not ready, retrying in 20s..."
+              sleep 20
+            done
+            echo "==> gRPC ready. Starting HTTP proxy on port 8000..."
+            python3 /httpserver/http_server.py \
+              --host=0.0.0.0 \
+              --port=8000 \
+              --jetstream_host=localhost \
+              --jetstream_port=9000
+          ports:
+          - name: http
+            containerPort: 8000
+          resources:
+            requests:
+              cpu: "2"
+              memory: "4Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            failureThreshold: 60
+            timeoutSeconds: 5
+
+    # ── WORKER ───────────────────────────────────────────────────
+    workerTemplate:
+      spec:
+        subdomain: llama3-70b-8tpu
+        nodeSelector:
+          cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+          cloud.google.com/gke-tpu-topology: 2x4
+        tolerations:
+        - key: "google.com/tpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+        volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: "150Gi"
+        - name: hf-cache
+          emptyDir:
+            sizeLimit: "120Gi"
+        - name: entrypoint
+          configMap:
+            name: jetstream-entrypoint
+            defaultMode: 0755
+        containers:
+
+        # ── Container: JetStream Worker ───────────────────────────
+        - name: jetstream-worker
+          image: us-docker.pkg.dev/cloud-tpu-images/inference/jetstream-pytorch-server:v0.2.4
+          imagePullPolicy: IfNotPresent
+          volumeMounts:
+          - mountPath: /dev/shm
+            name: dshm
+          - mountPath: /root/.cache/huggingface
+            name: hf-cache
+          - mountPath: /entrypoint
+            name: entrypoint
+          command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            echo "=============================================="
+            echo "WORKER: JAX Multihost JetStream"
+            echo "Pod IP   : $(hostname -i | awk '{print $1}')"
+            echo "Hostname : $(hostname)"
+            echo "=============================================="
+            LEADER_FQDN="llama3-70b-8tpu-0.llama3-70b-8tpu.default.svc.cluster.local"
+            echo "==> Resolving leader IP from: ${LEADER_FQDN}"
+            LEADER_IP=""
+            for i in $(seq 1 60); do
+              LEADER_IP=$(python3 -c "
+import socket
+try:
+    print(socket.gethostbyname('${LEADER_FQDN}'))
+except Exception:
+    pass
+" 2>/dev/null || true)
+              if [ -n "${LEADER_IP}" ]; then
+                echo "==> Leader IP resolved: ${LEADER_IP}"
+                break
+              fi
+              echo "    [${i}/60] DNS not ready, retrying in 3s..."
+              sleep 3
+            done
+            if [ -z "${LEADER_IP}" ]; then
+              echo "ERROR: Could not resolve leader IP after 3 minutes. Exiting."
+              exit 1
+            fi
+            echo "==> Starting JAX worker, coordinator=${LEADER_IP}:1234"
+            python3 /entrypoint/run_multihost.py \
+              --model_id=meta-llama/Llama-3.1-70B-Instruct \
+              --hf_token="${HF_TOKEN}" \
+              --port=9000 \
+              --override_batch_size=8 \
+              --max_input_length=2048 \
+              --max_output_length=1024 \
+              --coordinator_address="${LEADER_IP}:1234" \
+              --num_processes=2 \
+              --process_id=1
+          resources:
+            requests:
+              cpu: "8"
+              memory: "64Gi"
+            limits:
+              google.com/tpu: "4"
+          env:
+          - name: HF_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: hf-token
+                key: HF_TOKEN
+          - name: HUGGING_FACE_HUB_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: hf-token
+                key: HF_TOKEN
+          - name: JAX_PLATFORMS
+            value: "tpu"
+          - name: TF_CPP_MIN_LOG_LEVEL
+            value: "0"
+          readinessProbe:
+            exec:
+              command:
+              - python3
+              - -c
+              - |
+                import socket, sys
+                s = socket.socket()
+                s.settimeout(5)
+                r = s.connect_ex(('llama3-70b-8tpu-0.llama3-70b-8tpu.default.svc.cluster.local', 9000))
+                s.close()
+                sys.exit(0 if r == 0 else 1)
+            initialDelaySeconds: 480
+            periodSeconds: 30
+            failureThreshold: 30
+            timeoutSeconds: 15
+
+---
+# ── Headless Service: pod-to-pod DNS + JAX coordinator port ──────
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama3-70b-8tpu
+  namespace: default
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    leaderworkerset.sigs.k8s.io/name: llama3-70b-8tpu
+  ports:
+  - name: grpc
+    port: 9000
+    targetPort: 9000
+  - name: jax-coord
+    port: 1234
+    targetPort: 1234
+
+---
+# ── ClusterIP Service: app.py traffic → leader OpenAI proxy ──────
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-service-8tpu
+  namespace: default
+spec:
+  type: ClusterIP
+  selector:
+    app: llama3-8tpu
+    role: leader
+  ports:
+  - name: http
+    protocol: TCP
+    port: 8000
+    targetPort: 8000

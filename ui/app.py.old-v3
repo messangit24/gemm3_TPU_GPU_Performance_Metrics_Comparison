@@ -1,0 +1,167 @@
+import streamlit as st
+from openai import OpenAI
+import PyPDF2
+import io
+import os
+import time
+import pandas as pd
+from datetime import datetime
+
+from metrics_helper import get_latest_mxu_utilization, calculate_derived_metrics, HARDWARE_SPECS
+
+VLLM_API_URL = os.getenv("VLLM_API_URL", "http://vllm-service:8000/v1")
+MODEL_NAME = "google/gemma-3-27b-it"
+
+client = OpenAI(base_url=VLLM_API_URL, api_key="not-needed")
+
+st.set_page_config(page_title="Gemma 3 TPU Dashboard", layout="wide")
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "metrics_history" not in st.session_state:
+    st.session_state.metrics_history = [] 
+
+# ==========================================
+# Sidebar: Context Upload & Hardware Specs
+# ==========================================
+st.sidebar.header("📄 Context Upload")
+uploaded_file = st.sidebar.file_uploader("Upload a file for context", type=["txt", "pdf", "csv"])
+file_context = ""
+
+if uploaded_file:
+    if uploaded_file.name.endswith(".pdf"):
+        pdf_reader = PyPDF2.PdfReader(io.BytesIO(uploaded_file.read()))
+        file_context = "".join([page.extract_text() for page in pdf_reader.pages])
+    else:
+        file_context = uploaded_file.getvalue().decode("utf-8")
+    st.sidebar.success("File loaded successfully!")
+
+st.sidebar.markdown("---")
+st.sidebar.header("⚙️ Hardware Profile")
+st.sidebar.markdown(f"**TPU Model:** {HARDWARE_SPECS['tpu_type']}")
+st.sidebar.markdown(f"**Data Type:** {HARDWARE_SPECS['dtype']}")
+st.sidebar.markdown(f"**Max Compute (BF16):** {HARDWARE_SPECS['peak_tflops']} TFLOPs")
+st.sidebar.markdown(f"**Max Compute (INT8):** {HARDWARE_SPECS['peak_tops']} TOPs")
+
+# ==========================================
+# Main Layout: Chat (Left) & Dashboard (Right)
+# ==========================================
+col_chat, col_dash = st.columns([1.5, 1])
+
+with col_chat:
+    st.title("💬 Chatbot")
+    
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    if prompt := st.chat_input("Ask Gemma 3 anything..."):
+        if file_context and len(st.session_state.messages) == 0:
+            full_prompt = f"Context:\n{file_context}\n\nQuestion: {prompt}"
+        else:
+            full_prompt = prompt
+
+        st.session_state.messages.append({"role": "user", "content": full_prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            full_response = ""
+            
+            # --- Timing Initialization ---
+            start_time = time.time()
+            ttft_sec = 0.0
+            first_token_received = False
+            input_tokens = 0
+            output_tokens = 0
+            
+            response_stream = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=st.session_state.messages,
+                stream=True,
+                stream_options={"include_usage": True} 
+            )
+            
+            for chunk in response_stream:
+                # Track Time to First Token (Forward Time)
+                if not first_token_received and len(chunk.choices) > 0 and chunk.choices[0].delta.content:
+                    ttft_sec = time.time() - start_time
+                    first_token_received = True
+
+                if len(chunk.choices) > 0 and chunk.choices[0].delta.content:
+                    full_response += chunk.choices[0].delta.content
+                    message_placeholder.markdown(full_response + "▌")
+                
+                # Extract token counts from the final chunk
+                if chunk.usage:
+                    input_tokens = chunk.usage.prompt_tokens
+                    output_tokens = chunk.usage.completion_tokens
+            
+            message_placeholder.markdown(full_response)
+            
+            # --- Final Timing Calculations ---
+            total_time_sec = time.time() - start_time
+            decode_time_sec = total_time_sec - ttft_sec
+
+        st.session_state.messages.append({"role": "assistant", "content": full_response})
+
+        # Calculate TPU Performance metrics
+        tokens_sec, tflops, mfu = calculate_derived_metrics(output_tokens, total_time_sec)
+        mxu = get_latest_mxu_utilization()
+        timestamp_str = datetime.now().strftime("%H:%M:%S")
+
+        st.session_state.metrics_history.append({
+            "Timestamp": timestamp_str,
+            "Input Tokens": input_tokens,
+            "Output Tokens": output_tokens,
+            "Forward Time (s)": round(ttft_sec, 2),
+            "Decode Time (s)": round(decode_time_sec, 2),
+            "Total Time (s)": round(total_time_sec, 2),
+            "Tokens/Sec": tokens_sec,
+            "TFLOPs": tflops,
+            "MFU %": mfu,
+            "MXU %": mxu
+        })
+        
+        st.rerun()
+
+with col_dash:
+    st.title("📊 TPU Performance")
+    
+    if len(st.session_state.metrics_history) == 0:
+        st.info("Ask a question in the chat to generate live metrics.")
+    else:
+        df = pd.DataFrame(st.session_state.metrics_history)
+        latest = st.session_state.metrics_history[-1]
+        
+        # --- Query Timing Breakdown ---
+        st.subheader("Latest Query Timing")
+        t1, t2, t3 = st.columns(3)
+        t1.metric("Forward Time", f"{latest['Forward Time (s)']} s")
+        t2.metric("Decode Time", f"{latest['Decode Time (s)']} s")
+        t3.metric("Total Time", f"{latest['Total Time (s)']} s")
+        
+        # --- Token Processing ---
+        st.subheader("Token Data")
+        tok1, tok2, tok3 = st.columns(3)
+        tok1.metric("Input Tokens", f"{latest['Input Tokens']}")
+        tok2.metric("Output Tokens", f"{latest['Output Tokens']}")
+        tok3.metric("Throughput", f"{latest['Tokens/Sec']} t/s")
+        
+        # --- Utilization ---
+        st.subheader("Hardware Load")
+        u1, u2, u3 = st.columns(3)
+        u1.metric("Achieved TFLOPs", f"{latest['TFLOPs']}")
+        u2.metric("MFU", f"{latest['MFU %']} %")
+        u3.metric("Background MXU", f"{latest['MXU %']} %")
+        
+        st.markdown("---")
+        
+        # Charts and History
+        st.subheader("Throughput Over Time")
+        chart_df = df.set_index("Timestamp")
+        st.line_chart(chart_df[["Tokens/Sec"]], use_container_width=True)
+        
+        st.subheader("Query Details Log")
+        st.dataframe(chart_df[["Input Tokens", "Output Tokens", "Total Time (s)"]], use_container_width=True)

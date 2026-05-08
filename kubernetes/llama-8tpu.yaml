@@ -1,0 +1,268 @@
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: vllm-llama70b
+  namespace: default
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 2
+    restartPolicy: RecreateGroupOnPodRestart
+    leaderTemplate:
+      metadata:
+        labels:
+          app: vllm-llama70b
+          role: leader
+      spec:
+        subdomain: vllm-llama70b
+        nodeSelector:
+          cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+          cloud.google.com/gke-tpu-topology: 2x4
+        tolerations:
+        - key: "google.com/tpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+        containers:
+        - name: vllm
+          image: docker.io/vllm/vllm-tpu:latest
+          imagePullPolicy: Always
+          command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+
+            echo "=============================================="
+            echo "LEADER: vLLM on TPU multi-host"
+            echo "Pod IP  : $(hostname -i | awk '{print $1}')"
+            echo "Hostname : $(hostname)"
+            echo "TPU_WORKER_ID: $TPU_WORKER_ID"
+            echo "TPU_WORKER_HOSTNAMES: $TPU_WORKER_HOSTNAMES"
+            echo "=============================================="
+
+            # Start Ray head
+            ray start --head \
+              --port=6379 \
+              --num-cpus=0 \
+              --dashboard-host=0.0.0.0 \
+              --block &
+
+            echo "==> Waiting for Ray worker to connect..."
+            while true; do
+              NODES=$(python3 -c "
+            import ray
+            ray.init(address='auto', ignore_reinit_error=True)
+            nodes = [n for n in ray.nodes() if n['Alive']]
+            print(len(nodes))
+            " 2>/dev/null || echo "0")
+              echo "  Alive Ray nodes: $NODES"
+              if [ "$NODES" -ge 2 ]; then
+                echo "==> All Ray workers connected!"
+                break
+              fi
+              sleep 10
+            done
+
+            echo "==> Starting vLLM server..."
+            python3 -m vllm.entrypoints.openai.api_server \
+              --host=0.0.0.0 \
+              --port=8000 \
+              --model=meta-llama/Llama-3.1-70B-Instruct \
+              --served-model-name=meta-llama/Llama-3.1-70B-Instruct \
+              --tensor-parallel-size=8 \
+              --max-model-len=4096 \
+              --max-num-seqs=16 \
+              --dtype=bfloat16 \
+              --download-dir=/data \
+              --disable-log-requests
+          ports:
+          - name: http
+            containerPort: 8000
+          - name: ray
+            containerPort: 6379
+          env:
+          - name: HF_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: hf-token
+                key: HF_TOKEN
+          - name: HUGGING_FACE_HUB_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: hf-token
+                key: HF_TOKEN
+          - name: HF_HOME
+            value: /data/hf
+          - name: VLLM_XLA_CACHE_PATH
+            value: /data/vllm-xla-cache
+          - name: PJRT_DEVICE
+            value: TPU
+          - name: VLLM_WORKER_MULTIPROC_METHOD
+            value: spawn
+          resources:
+            requests:
+              cpu: "16"
+              memory: "100Gi"
+            limits:
+              google.com/tpu: "4"
+              cpu: "32"
+              memory: "200Gi"
+          volumeMounts:
+          - name: data
+            mountPath: /data
+          - name: dshm
+            mountPath: /dev/shm
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            failureThreshold: 120
+            periodSeconds: 30
+            timeoutSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 5
+        volumes:
+        - name: data
+          emptyDir:
+            sizeLimit: 200Gi
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+    workerTemplate:
+      spec:
+        subdomain: vllm-llama70b
+        nodeSelector:
+          cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+          cloud.google.com/gke-tpu-topology: 2x4
+        tolerations:
+        - key: "google.com/tpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+        containers:
+        - name: vllm-worker
+          image: docker.io/vllm/vllm-tpu:latest
+          imagePullPolicy: Always
+          command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+
+            echo "=============================================="
+            echo "WORKER: vLLM on TPU multi-host"
+            echo "Pod IP  : $(hostname -i | awk '{print $1}')"
+            echo "Hostname : $(hostname)"
+            echo "TPU_WORKER_ID: $TPU_WORKER_ID"
+            echo "=============================================="
+
+            LEADER_FQDN="vllm-llama70b-0.vllm-llama70b.default.svc.cluster.local"
+            echo "==> Resolving leader: $LEADER_FQDN"
+
+            LEADER_IP=""
+            for i in $(seq 1 120); do
+              LEADER_IP=$(python3 -c "import socket; print(socket.gethostbyname('$LEADER_FQDN'))" 2>/dev/null || true)
+              if [ -n "$LEADER_IP" ]; then
+                echo "==> Leader IP: $LEADER_IP"
+                break
+              fi
+              echo "  [$i/120] waiting for DNS..."
+              sleep 5
+            done
+
+            if [ -z "$LEADER_IP" ]; then
+              echo "ERROR: Cannot resolve leader"
+              exit 1
+            fi
+
+            echo "==> Connecting Ray worker to $LEADER_IP:6379"
+            ray start \
+              --address="$LEADER_IP:6379" \
+              --num-cpus=0 \
+              --block
+          env:
+          - name: HF_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: hf-token
+                key: HF_TOKEN
+          - name: HUGGING_FACE_HUB_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: hf-token
+                key: HF_TOKEN
+          - name: HF_HOME
+            value: /data/hf
+          - name: VLLM_XLA_CACHE_PATH
+            value: /data/vllm-xla-cache
+          - name: PJRT_DEVICE
+            value: TPU
+          - name: VLLM_WORKER_MULTIPROC_METHOD
+            value: spawn
+          resources:
+            requests:
+              cpu: "16"
+              memory: "100Gi"
+            limits:
+              google.com/tpu: "4"
+              cpu: "32"
+              memory: "200Gi"
+          volumeMounts:
+          - name: data
+            mountPath: /data
+          - name: dshm
+            mountPath: /dev/shm
+        volumes:
+        - name: data
+          emptyDir:
+            sizeLimit: 200Gi
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-llama70b
+  namespace: default
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    leaderworkerset.sigs.k8s.io/name: vllm-llama70b
+  ports:
+  - name: http
+    port: 8000
+    targetPort: 8000
+  - name: ray
+    port: 6379
+    targetPort: 6379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-service-8tpu
+  namespace: default
+spec:
+  type: ClusterIP
+  selector:
+    app: vllm-llama70b
+    role: leader
+  ports:
+  - name: http
+    protocol: TCP
+    port: 8000
+    targetPort: 8000

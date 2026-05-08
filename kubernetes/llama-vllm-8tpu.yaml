@@ -1,0 +1,307 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vllm-jax-launcher
+  namespace: default
+data:
+  launch_vllm.py: |
+    """
+    Multi-host vLLM launcher: bootstrap JAX distributed BEFORE vLLM imports.
+    This MUST be the first thing that runs in the process so the TPU runtime
+    forms a single 8-device mesh across both hosts.
+    """
+    import os
+    import sys
+    import runpy
+
+    # ---------------------------------------------------------------
+    # Step 1: Initialize JAX distributed FIRST, before any TPU import
+    # ---------------------------------------------------------------
+    coord    = os.environ["JAX_COORDINATOR_ADDRESS"]
+    num_proc = int(os.environ["JAX_NUM_PROCESSES"])
+    proc_id  = int(os.environ["JAX_PROCESS_ID"])
+
+    print(f"[launcher] Calling jax.distributed.initialize("
+          f"coordinator={coord}, num_processes={num_proc}, process_id={proc_id})",
+          flush=True)
+
+    import jax
+    jax.distributed.initialize(
+        coordinator_address=coord,
+        num_processes=num_proc,
+        process_id=proc_id,
+    )
+
+    # ---------------------------------------------------------------
+    # Step 2: Verify the global mesh is 8 devices
+    # ---------------------------------------------------------------
+    print(f"[launcher] JAX initialized successfully:", flush=True)
+    print(f"[launcher]   process_count        = {jax.process_count()}", flush=True)
+    print(f"[launcher]   process_index        = {jax.process_index()}", flush=True)
+    print(f"[launcher]   device_count (global) = {jax.device_count()}", flush=True)
+    print(f"[launcher]   local_device_count    = {jax.local_device_count()}", flush=True)
+
+    if jax.device_count() != 8:
+        print(f"[launcher] FATAL: expected 8 global devices, got {jax.device_count()}",
+              flush=True)
+        sys.exit(1)
+
+    # ---------------------------------------------------------------
+    # Step 3: Hand off to vLLM by running its module as __main__
+    # ---------------------------------------------------------------
+    print("[launcher] Handing off to vLLM API server...", flush=True)
+    # Replace argv[0] so vLLM's argparse sees a sensible program name.
+    # Everything after argv[0] (the vLLM CLI flags) was passed in by bash.
+    sys.argv[0] = "vllm.entrypoints.openai.api_server"
+    runpy.run_module(
+        "vllm.entrypoints.openai.api_server",
+        run_name="__main__",
+        alter_sys=True,
+    )
+---
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: vllm-llama70b
+  namespace: default
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 2  # 1 leader + 1 worker = 2 hosts × 4 chips = 8 TPU v6e chips
+    restartPolicy: RecreateGroupOnPodRestart
+    leaderTemplate:
+      metadata:
+        labels:
+          app: vllm-llama70b
+          role: leader
+        annotations:
+          # Forces both pods onto the same 2x4 TPU slice so the
+          # GKE TPU webhook injects TPU_WORKER_HOSTNAMES correctly.
+          leaderworkerset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+      spec:
+        subdomain: vllm-llama70b
+        nodeSelector:
+          cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+          cloud.google.com/gke-tpu-topology: 2x4
+        tolerations:
+        - key: "google.com/tpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+        containers:
+        - name: vllm-leader
+          image: docker.io/vllm/vllm-tpu:latest
+          imagePullPolicy: Always
+          command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            echo "=============================================="
+            echo "LEADER (TPU_WORKER_ID=$TPU_WORKER_ID)"
+            echo "HOST: $(hostname)  IP: $(hostname -i)"
+            echo "TPU_WORKER_HOSTNAMES: $TPU_WORKER_HOSTNAMES"
+            echo "TPU_NAME: ${TPU_NAME:-unset}"
+            echo "LWS_LEADER_ADDRESS: ${LWS_LEADER_ADDRESS:-unset}"
+            echo "=============================================="
+
+            # --- Sanity checks ---
+            if [ -z "${TPU_WORKER_HOSTNAMES:-}" ]; then
+              echo "FATAL: TPU_WORKER_HOSTNAMES not set. Multi-host TPU webhook did not fire."
+              exit 1
+            fi
+
+            # --- Wait for all peer pods to be DNS-resolvable ---
+            echo "Waiting for all TPU peers to be DNS-resolvable..."
+            IFS=',' read -ra HOSTS <<< "$TPU_WORKER_HOSTNAMES"
+            for H in "${HOSTS[@]}"; do
+              for i in {1..120}; do
+                if getent hosts "$H" >/dev/null 2>&1; then
+                  echo "  ✓ $H resolves to $(getent hosts "$H" | awk '{print $1}')"
+                  break
+                fi
+                echo "  waiting for $H ... ($i)"; sleep 2
+              done
+            done
+
+            # --- JAX distributed init parameters (read by the launcher) ---
+            export JAX_COORDINATOR_ADDRESS="${LWS_LEADER_ADDRESS}:1234"
+            export JAX_NUM_PROCESSES="${LWS_GROUP_SIZE}"
+            export JAX_PROCESS_ID="${TPU_WORKER_ID}"
+
+            echo "JAX_COORDINATOR_ADDRESS=$JAX_COORDINATOR_ADDRESS"
+            echo "JAX_NUM_PROCESSES=$JAX_NUM_PROCESSES"
+            echo "JAX_PROCESS_ID=$JAX_PROCESS_ID"
+
+            # --- Launch vLLM via the JAX-aware wrapper ---
+            exec python3 /launcher/launch_vllm.py \
+              --host=0.0.0.0 \
+              --port=8000 \
+              --model=meta-llama/Llama-3.1-70B-Instruct \
+              --served-model-name=meta-llama/Llama-3.1-70B-Instruct \
+              --tensor-parallel-size=8 \
+              --max-model-len=4096 \
+              --max-num-seqs=16 \
+              --dtype=bfloat16 \
+              --download-dir=/data \
+              --enforce-eager
+          ports:
+          - { name: http,      containerPort: 8000 }
+          - { name: jax-coord, containerPort: 1234 }
+          env:
+          - name: HF_TOKEN
+            valueFrom: { secretKeyRef: { name: hf-token, key: HF_TOKEN } }
+          - name: HUGGING_FACE_HUB_TOKEN
+            valueFrom: { secretKeyRef: { name: hf-token, key: HF_TOKEN } }
+          - { name: HF_HOME,             value: /data/hf }
+          - { name: VLLM_XLA_CACHE_PATH, value: /data/vllm-xla-cache }
+          - { name: PJRT_DEVICE,         value: TPU }
+          - { name: JAX_PLATFORMS,       value: tpu }
+          resources:
+            requests: { cpu: "16", memory: "100Gi" }
+            limits:   { cpu: "32", memory: "200Gi", google.com/tpu: "4" }
+          volumeMounts:
+          - { name: data,     mountPath: /data }
+          - { name: dshm,     mountPath: /dev/shm }
+          - { name: launcher, mountPath: /launcher }
+          startupProbe:
+            httpGet: { path: /health, port: 8000 }
+            failureThreshold: 360       # 360 × 30s = 3 hours grace for download + compile
+            periodSeconds: 30
+            timeoutSeconds: 10
+          # No readiness/liveness probes during initial bring-up to avoid
+          # spurious restarts. Add them back once stable.
+        volumes:
+        - { name: data, emptyDir: { sizeLimit: 400Gi } }
+        - { name: dshm, emptyDir: { medium: Memory, sizeLimit: 64Gi } }
+        - name: launcher
+          configMap:
+            name: vllm-jax-launcher
+
+    workerTemplate:
+      spec:
+        subdomain: vllm-llama70b
+        nodeSelector:
+          cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+          cloud.google.com/gke-tpu-topology: 2x4
+        tolerations:
+        - key: "google.com/tpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+        containers:
+        - name: vllm-worker
+          image: docker.io/vllm/vllm-tpu:latest
+          imagePullPolicy: Always
+          command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            echo "=============================================="
+            echo "WORKER (TPU_WORKER_ID=$TPU_WORKER_ID)"
+            echo "HOST: $(hostname)  IP: $(hostname -i)"
+            echo "TPU_WORKER_HOSTNAMES: $TPU_WORKER_HOSTNAMES"
+            echo "LWS_LEADER_ADDRESS: ${LWS_LEADER_ADDRESS:-unset}"
+            echo "=============================================="
+
+            if [ -z "${TPU_WORKER_HOSTNAMES:-}" ]; then
+              echo "FATAL: TPU_WORKER_HOSTNAMES not set on worker."
+              exit 1
+            fi
+
+            # Wait for peers
+            echo "Waiting for all TPU peers to be DNS-resolvable..."
+            IFS=',' read -ra HOSTS <<< "$TPU_WORKER_HOSTNAMES"
+            for H in "${HOSTS[@]}"; do
+              for i in {1..120}; do
+                if getent hosts "$H" >/dev/null 2>&1; then
+                  echo "  ✓ $H resolves"
+                  break
+                fi
+                echo "  waiting for $H ... ($i)"; sleep 2
+              done
+            done
+
+            # Wait specifically for leader's coordinator port to open before joining
+            echo "Waiting for JAX coordinator at ${LWS_LEADER_ADDRESS}:1234 ..."
+            for i in {1..180}; do
+              if (echo > /dev/tcp/${LWS_LEADER_ADDRESS}/1234) 2>/dev/null; then
+                echo "  ✓ coordinator reachable"
+                break
+              fi
+              echo "  waiting for coordinator ... ($i)"; sleep 5
+            done
+
+            export JAX_COORDINATOR_ADDRESS="${LWS_LEADER_ADDRESS}:1234"
+            export JAX_NUM_PROCESSES="${LWS_GROUP_SIZE}"
+            export JAX_PROCESS_ID="${TPU_WORKER_ID}"
+
+            echo "JAX_COORDINATOR_ADDRESS=$JAX_COORDINATOR_ADDRESS"
+            echo "JAX_NUM_PROCESSES=$JAX_NUM_PROCESSES"
+            echo "JAX_PROCESS_ID=$JAX_PROCESS_ID"
+
+            # Worker runs the same launcher (only rank 0 actually serves HTTP)
+            exec python3 /launcher/launch_vllm.py \
+              --host=0.0.0.0 \
+              --port=8000 \
+              --model=meta-llama/Llama-3.1-70B-Instruct \
+              --served-model-name=meta-llama/Llama-3.1-70B-Instruct \
+              --tensor-parallel-size=8 \
+              --max-model-len=4096 \
+              --max-num-seqs=16 \
+              --dtype=bfloat16 \
+              --download-dir=/data \
+              --enforce-eager
+          ports:
+          - { name: jax-coord, containerPort: 1234 }
+          env:
+          - name: HF_TOKEN
+            valueFrom: { secretKeyRef: { name: hf-token, key: HF_TOKEN } }
+          - name: HUGGING_FACE_HUB_TOKEN
+            valueFrom: { secretKeyRef: { name: hf-token, key: HF_TOKEN } }
+          - { name: HF_HOME,             value: /data/hf }
+          - { name: VLLM_XLA_CACHE_PATH, value: /data/vllm-xla-cache }
+          - { name: PJRT_DEVICE,         value: TPU }
+          - { name: JAX_PLATFORMS,       value: tpu }
+          resources:
+            requests: { cpu: "16", memory: "100Gi" }
+            limits:   { cpu: "32", memory: "200Gi", google.com/tpu: "4" }
+          volumeMounts:
+          - { name: data,     mountPath: /data }
+          - { name: dshm,     mountPath: /dev/shm }
+          - { name: launcher, mountPath: /launcher }
+        volumes:
+        - { name: data, emptyDir: { sizeLimit: 400Gi } }
+        - { name: dshm, emptyDir: { medium: Memory, sizeLimit: 64Gi } }
+        - name: launcher
+          configMap:
+            name: vllm-jax-launcher
+---
+# Headless service — REQUIRED for stable per-pod DNS used by the TPU runtime
+# AND for JAX coordinator address resolution. Name MUST match `subdomain`.
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-llama70b
+  namespace: default
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    leaderworkerset.sigs.k8s.io/name: vllm-llama70b
+  ports:
+  - { name: http,      port: 8000, targetPort: 8000 }
+  - { name: jax-coord, port: 1234, targetPort: 1234 }
+---
+# Client-facing service — selects ONLY the leader pod
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-service-8tpu
+  namespace: default
+spec:
+  type: ClusterIP
+  selector:
+    app: vllm-llama70b
+    role: leader
+  ports:
+  - { name: http, protocol: TCP, port: 8000, targetPort: 8000 }

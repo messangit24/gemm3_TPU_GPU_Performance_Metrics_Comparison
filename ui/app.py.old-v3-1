@@ -1,0 +1,208 @@
+import streamlit as st
+from openai import OpenAI
+import PyPDF2
+import io
+import os
+import time
+import pandas as pd
+from datetime import datetime, timedelta, timezone
+
+from metrics_helper import (
+    get_latest_mxu_utilization, 
+    calculate_derived_metrics, 
+    HARDWARE_SPECS, 
+    save_metrics_to_bigquery,
+    fetch_bigquery_metrics
+)
+
+VLLM_API_URL = os.getenv("VLLM_API_URL", "http://vllm-service:8000/v1")
+MODEL_NAME = "google/gemma-3-27b-it"
+
+client = OpenAI(base_url=VLLM_API_URL, api_key="not-needed")
+
+st.set_page_config(page_title="Gemma 3 TPU Dashboard", layout="wide")
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# ==========================================
+# Caching the BQ Fetch to preserve UI speed
+# ==========================================
+@st.cache_data(ttl=30)
+def get_filtered_history(time_label, custom_start=None, custom_end=None):
+    now_utc = datetime.now(timezone.utc)
+    
+    if time_label == "Last 5 Minutes":
+        start_time = now_utc - timedelta(minutes=5)
+    elif time_label == "Last 1 Hour":
+        start_time = now_utc - timedelta(hours=1)
+    elif time_label == "Last 24 Hours":
+        start_time = now_utc - timedelta(hours=24)
+    elif time_label == "Last 7 Days":
+        start_time = now_utc - timedelta(days=7)
+    elif time_label == "Last 30 Days":
+        start_time = now_utc - timedelta(days=30)
+    elif time_label == "Custom Range" and custom_start and custom_end:
+        start_time = datetime.combine(custom_start, datetime.min.time()).replace(tzinfo=timezone.utc)
+        end_time = datetime.combine(custom_end, datetime.max.time()).replace(tzinfo=timezone.utc)
+        return fetch_bigquery_metrics(start_time, end_time)
+    else:
+        start_time = now_utc - timedelta(hours=24)
+
+    return fetch_bigquery_metrics(start_time, now_utc)
+
+# ==========================================
+# Sidebar
+# ==========================================
+st.sidebar.header("📄 Context Upload")
+uploaded_file = st.sidebar.file_uploader("Upload a file for context", type=["txt", "pdf", "csv"])
+file_context = ""
+
+if uploaded_file:
+    if uploaded_file.name.endswith(".pdf"):
+        pdf_reader = PyPDF2.PdfReader(io.BytesIO(uploaded_file.read()))
+        file_context = "".join([page.extract_text() for page in pdf_reader.pages])
+    else:
+        file_context = uploaded_file.getvalue().decode("utf-8")
+    st.sidebar.success("File loaded successfully!")
+
+st.sidebar.markdown("---")
+st.sidebar.header("⚙️ Hardware Profile")
+st.sidebar.markdown(f"**TPU Model:** {HARDWARE_SPECS['tpu_type']}")
+st.sidebar.markdown(f"**Data Type:** {HARDWARE_SPECS['dtype']}")
+st.sidebar.markdown(f"**Max Compute:** {HARDWARE_SPECS['peak_tflops']} TFLOPs")
+
+# ==========================================
+# Main Layout
+# ==========================================
+col_chat, col_dash = st.columns([1.5, 1.2])
+
+with col_chat:
+    st.title("💬 Chatbot")
+    
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    if prompt := st.chat_input("Ask Gemma 3 anything..."):
+        if file_context and len(st.session_state.messages) == 0:
+            full_prompt = f"Context:\n{file_context}\n\nQuestion: {prompt}"
+        else:
+            full_prompt = prompt
+
+        st.session_state.messages.append({"role": "user", "content": full_prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            full_response = ""
+            
+            start_time = time.time()
+            ttft_sec = 0.0
+            first_token_received = False
+            input_tokens = 0
+            output_tokens = 0
+            
+            response_stream = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=st.session_state.messages,
+                stream=True,
+                stream_options={"include_usage": True} 
+            )
+            
+            for chunk in response_stream:
+                if not first_token_received and len(chunk.choices) > 0 and chunk.choices[0].delta.content:
+                    ttft_sec = time.time() - start_time
+                    first_token_received = True
+
+                if len(chunk.choices) > 0 and chunk.choices[0].delta.content:
+                    full_response += chunk.choices[0].delta.content
+                    message_placeholder.markdown(full_response + "▌")
+                
+                if chunk.usage:
+                    input_tokens = chunk.usage.prompt_tokens
+                    output_tokens = chunk.usage.completion_tokens
+            
+            message_placeholder.markdown(full_response)
+            total_time_sec = time.time() - start_time
+            decode_time_sec = total_time_sec - ttft_sec
+
+        st.session_state.messages.append({"role": "assistant", "content": full_response})
+
+        tokens_sec, tflops, mfu = calculate_derived_metrics(output_tokens, total_time_sec)
+        mxu = get_latest_mxu_utilization()
+        
+        # BigQuery uses strict ISO 8601 formatting for TIMESTAMP insertion
+        timestamp_str = datetime.now(timezone.utc).isoformat()
+
+        metric_record = {
+            "query_timestamp": timestamp_str,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "forward_time_sec": round(ttft_sec, 2),
+            "decode_time_sec": round(decode_time_sec, 2),
+            "total_time_sec": round(total_time_sec, 2),
+            "tokens_per_sec": tokens_sec,
+            "tflops": tflops,
+            "mfu_percent": mfu,
+            "mxu_percent": mxu
+        }
+
+        save_metrics_to_bigquery(metric_record)
+        get_filtered_history.clear()
+        st.rerun()
+
+with col_dash:
+    st.title("📊 TPU Performance")
+    
+    # Filtering Controls
+    st.markdown("### Filter Dashboard")
+    time_filter = st.selectbox(
+        "Select Timeframe",
+        ["Last 5 Minutes", "Last 1 Hour", "Last 24 Hours", "Last 7 Days", "Last 30 Days", "Custom Range"],
+        index=2
+    )
+    
+    custom_start, custom_end = None, None
+    if time_filter == "Custom Range":
+        c1, c2 = st.columns(2)
+        custom_start = c1.date_input("Start Date", value=datetime.today() - timedelta(days=7))
+        custom_end = c2.date_input("End Date", value=datetime.today())
+
+    # Fetch Data from BigQuery
+    data = get_filtered_history(time_filter, custom_start, custom_end)
+    
+    st.markdown("---")
+    
+    if not data:
+        st.info(f"No metric data found for: **{time_filter}**")
+    else:
+        df = pd.DataFrame(data)
+        # Ensure timestamp is treated as a datetime object in Pandas
+        df['query_timestamp'] = pd.to_datetime(df['query_timestamp'])
+        
+        st.subheader("Aggregated Insights")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total Queries", len(df))
+        m2.metric("Avg Tokens/Sec", f"{round(df['tokens_per_sec'].mean(), 2)} t/s")
+        m3.metric("Peak MFU", f"{df['mfu_percent'].max()} %")
+        
+        st.subheader("Throughput Trend")
+        st.line_chart(df.set_index("query_timestamp")[["tokens_per_sec"]], use_container_width=True)
+        
+        st.subheader("Hardware Load Trend")
+        st.line_chart(df.set_index("query_timestamp")[["mfu_percent", "mxu_percent"]], use_container_width=True)
+        
+        st.subheader("Query Log")
+        # Format the dataframe columns for cleaner reading in the UI
+        display_df = df[["query_timestamp", "input_tokens", "output_tokens", "total_time_sec", "tokens_per_sec"]].copy()
+        display_df.rename(columns={
+            "query_timestamp": "Timestamp", 
+            "input_tokens": "Input Tokens", 
+            "output_tokens": "Output Tokens", 
+            "total_time_sec": "Total Time (s)", 
+            "tokens_per_sec": "Tokens/Sec"
+        }, inplace=True)
+        
+        st.dataframe(display_df.set_index("Timestamp"), use_container_width=True)

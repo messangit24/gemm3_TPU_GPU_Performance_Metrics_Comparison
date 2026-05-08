@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gemma3-27b-a100
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gemma3-a100
+  template:
+    metadata:
+      labels:
+        app: gemma3-a100
+    spec:
+      nodeSelector:
+        cloud.google.com/gke-accelerator: nvidia-tesla-a100
+      containers:
+      - name: vllm-gpu
+        # Note: We use the standard vLLM image here, not the TPU one!
+        image: vllm/vllm-openai:latest
+        command:
+          - python3
+          - -m
+          - vllm.entrypoints.openai.api_server
+          - --model=google/gemma-3-27b-it
+          - --tensor-parallel-size=4
+          - --port=8000
+        ports:
+          - containerPort: 8000
+        resources:
+          limits:
+            nvidia.com/gpu: "4"
+        env:
+          - name: HUGGING_FACE_HUB_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: hf-token
+                key: HF_TOKEN
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-service-a100
+spec:
+  selector:
+    app: gemma3-a100
+  ports:
+    - protocol: TCP
+      port: 8000
+      targetPort: 8000

@@ -1,0 +1,163 @@
+import time
+import json
+import requests
+import os
+from google.cloud import monitoring_v3
+from google.cloud import storage
+from google.protobuf.timestamp_pb2 import Timestamp
+
+# ==========================================
+# Configuration from Environment Variables
+# ==========================================
+PROJECT_ID = os.getenv("PROJECT_ID")
+CLUSTER_NAME = os.getenv("CLUSTER_NAME")
+VLLM_METRICS_URL = os.getenv("VLLM_METRICS_URL", "http://vllm-service:8000/metrics")
+GCS_BUCKET = os.getenv("GCS_BUCKET") 
+RUN_DURATION_MINUTES = 10 
+
+# Hardware Constants for Trillium v6e
+V6E_PEAK_BFLOAT16_TFLOPS = 394
+MODEL_PARAMS = 27 * (10**9) 
+
+def fetch_gcp_hardware_metrics():
+    """Fetches hardware metrics using the standard ListTimeSeries API to avoid deprecation issues."""
+    if not PROJECT_ID or not CLUSTER_NAME:
+        return {"error": "Missing PROJECT_ID or CLUSTER_NAME in environment variables"}
+
+    client = monitoring_v3.MetricServiceClient()
+    project_name = f"projects/{PROJECT_ID}"
+
+    # Define the time window (Last X minutes)
+    now = time.time()
+    start_time = Timestamp()
+    start_time.FromSeconds(int(now - (RUN_DURATION_MINUTES * 60)))
+    end_time = Timestamp()
+    end_time.FromSeconds(int(now))
+
+    interval = monitoring_v3.TimeInterval({
+        "start_time": start_time,
+        "end_time": end_time,
+    })
+
+    # The Google Cloud metric paths
+    metric_paths = {
+        "mxu_utilization": "kubernetes.io/container/accelerator/duty_cycle",
+        "hbm_memory_used_bytes": "kubernetes.io/container/accelerator/memory_used",
+        "hbm_memory_total_bytes": "kubernetes.io/container/accelerator/memory_total",
+        "sparse_core_utilization": "tpu.googleapis.com/tpu/sparse_core/utilization",
+        "pcie_bandwidth_tx": "tpu.googleapis.com/tpu/network/pcie_tx_bytes",
+        "pcie_bandwidth_rx": "tpu.googleapis.com/tpu/network/pcie_rx_bytes",
+    }
+
+    results = {}
+    for key, metric_type in metric_paths.items():
+        try:
+            # Query GCP Monitoring safely
+            results_iterator = client.list_time_series(
+                request={
+                    "name": project_name,
+                    "filter": f'metric.type = "{metric_type}" AND resource.labels.cluster_name = "{CLUSTER_NAME}"',
+                    "interval": interval,
+                    "view": monitoring_v3.ListTimeSeriesRequest.TimeSeriesView.FULL,
+                }
+            )
+            
+            points = []
+            for series in results_iterator:
+                for point in series.points:
+                    # Extract the numerical value based on its type
+                    points.append(point.value.double_value or point.value.int64_value)
+            
+            # Average the metric over the timeframe, default to 0.0 if no data
+            results[key] = (sum(points) / len(points)) if points else 0.0
+            
+        except Exception as e:
+            results[key] = f"Error: {e}"
+            
+    return results
+
+def fetch_vllm_software_metrics():
+    """Pulls standard prometheus counters from the running vLLM engine and parses labels."""
+    try:
+        response = requests.get(VLLM_METRICS_URL)
+        metrics = {}
+        for line in response.text.split('\n'):
+            if line and not line.startswith('#'):
+                # Split from the right to separate the key string from the number
+                parts = line.rsplit(' ', 1)
+                if len(parts) == 2:
+                    raw_key = parts[0]
+                    val = float(parts[1])
+                    
+                    # Strip out the prometheus labels (everything inside {})
+                    base_key = raw_key.split('{')[0]
+                    
+                    # Sum up values if the metric is split across multiple labels
+                    if base_key in metrics:
+                        metrics[base_key] += val
+                    else:
+                        metrics[base_key] = val
+        return metrics
+    except Exception as e:
+        print(f"Failed to fetch vLLM metrics: {e}")
+        return {}
+
+def generate_report():
+    """Aggregates all hardware and software metrics into a single JSON report."""
+    hw_metrics = fetch_gcp_hardware_metrics()
+    sw_metrics = fetch_vllm_software_metrics()
+    
+    # Calculate performance numbers
+    tokens_per_sec = sw_metrics.get('vllm:generation_tokens_total', 0) / max(sw_metrics.get('vllm:uptime_seconds', 60), 1)
+    achieved_tflops = (2 * MODEL_PARAMS * tokens_per_sec) / (10**12)
+    mfu_percent = (achieved_tflops / (V6E_PEAK_BFLOAT16_TFLOPS * 4)) * 100
+    
+    # Safely calculate HBM percentage
+    hbm_used = hw_metrics.get("hbm_memory_used_bytes", 0)
+    hbm_total = hw_metrics.get("hbm_memory_total_bytes", 1)
+    
+    if isinstance(hbm_used, (int, float)) and isinstance(hbm_total, (int, float)) and hbm_total > 0:
+        hbm_percent = round((hbm_used / hbm_total) * 100, 2)
+    else:
+        hbm_percent = "N/A"
+
+    report = {
+        "report_generated_at": time.ctime(),
+        "performance_metrics": {
+            "tokens_per_sec": round(tokens_per_sec, 2),
+            "total_queries_served": sw_metrics.get('vllm:request_success_total', 0),
+        },
+        "hardware_utilization": {
+            "dtype": "bfloat16",
+            "achieved_tflops": round(achieved_tflops, 2),
+            "mfu_percent": round(mfu_percent, 2),
+            "mxu_tensor_core_utilization_percent": hw_metrics.get("mxu_utilization", 0.0),
+            "hbm_utilization_percent": hbm_percent,
+            "sparse_cores_utilization_percent": hw_metrics.get("sparse_core_utilization", 0.0),
+            "cpu_to_tpu_pcie_tx_bytes": hw_metrics.get("pcie_bandwidth_tx", 0.0),
+            "cpu_to_tpu_pcie_rx_bytes": hw_metrics.get("pcie_bandwidth_rx", 0.0),
+        }
+    }
+    
+    # Upload to Google Cloud Storage
+    if GCS_BUCKET and GCS_BUCKET != "your-tpu-metrics-bucket":
+        try:
+            filename = f"gemma3_v6e_report_{int(time.time())}.json"
+            
+            # Save a copy locally first
+            with open(filename, 'w') as f:
+                json.dump(report, f, indent=4)
+                
+            # Stream the file up to GCS
+            client = storage.Client(project=PROJECT_ID)
+            bucket = client.bucket(GCS_BUCKET)
+            blob = bucket.blob(f"gemma3-vruns/{filename}")
+            blob.upload_from_filename(filename)
+            
+            report["gcs_upload_status"] = f"Success: gs://{GCS_BUCKET}/gemma3-vruns/{filename}"
+        except Exception as e:
+            report["gcs_upload_status"] = f"Failed to upload to GCS: {e}"
+    else:
+        report["gcs_upload_status"] = "Skipped: GCS_BUCKET not configured or left as placeholder."
+
+    return report

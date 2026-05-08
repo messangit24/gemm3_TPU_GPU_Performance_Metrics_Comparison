@@ -1,0 +1,96 @@
+import time
+import json
+import requests
+import os
+from google.cloud import monitoring_v3
+from google.cloud import storage
+from google.cloud.monitoring_v3.query import Query
+
+PROJECT_ID = os.getenv("PROJECT_ID")
+CLUSTER_NAME = os.getenv("CLUSTER_NAME")
+VLLM_METRICS_URL = os.getenv("VLLM_METRICS_URL", "http://vllm-service:8000/metrics")
+GCS_BUCKET = os.getenv("GCS_BUCKET") 
+RUN_DURATION_MINUTES = 10 
+
+V6E_PEAK_BFLOAT16_TFLOPS = 394
+MODEL_PARAMS = 27 * (10**9) 
+
+def fetch_gcp_hardware_metrics():
+    client = monitoring_v3.MetricServiceClient()
+    metric_paths = {
+        "mxu_utilization": "kubernetes.io/container/accelerator/duty_cycle",
+        "hbm_memory_used_bytes": "kubernetes.io/container/accelerator/memory_used",
+        "hbm_memory_total_bytes": "kubernetes.io/container/accelerator/memory_total",
+        "sparse_core_utilization": "tpu.googleapis.com/tpu/sparse_core/utilization",
+        "pcie_bandwidth_tx": "tpu.googleapis.com/tpu/network/pcie_tx_bytes",
+        "pcie_bandwidth_rx": "tpu.googleapis.com/tpu/network/pcie_rx_bytes",
+    }
+    results = {}
+    for key, metric_type in metric_paths.items():
+        try:
+            query = Query(client, PROJECT_ID).select_metrics(metric_type).select_resources(cluster_name=CLUSTER_NAME).last(minutes=RUN_DURATION_MINUTES)
+            points = [p.value.double_value or p.value.int64_value for ts in query for p in ts.points]
+            results[key] = (sum(points) / len(points)) if points else 0.0
+        except Exception as e:
+            results[key] = f"Error or unavailable: {e}"
+    return results
+
+def fetch_vllm_software_metrics():
+    try:
+        response = requests.get(VLLM_METRICS_URL)
+        metrics = {}
+        for line in response.text.split('\n'):
+            if line and not line.startswith('#'):
+                parts = line.split(' ')
+                if len(parts) >= 2:
+                    metrics[parts[0]] = float(parts[1])
+        return metrics
+    except Exception as e:
+        return {}
+
+def generate_report():
+    hw_metrics = fetch_gcp_hardware_metrics()
+    sw_metrics = fetch_vllm_software_metrics()
+    
+    tokens_per_sec = sw_metrics.get('vllm:generation_tokens_total', 0) / max(sw_metrics.get('vllm:uptime_seconds', 60), 1)
+    achieved_tflops = (2 * MODEL_PARAMS * tokens_per_sec) / (10**12)
+    mfu_percent = (achieved_tflops / (V6E_PEAK_BFLOAT16_TFLOPS * 4)) * 100
+    
+    hbm_used = hw_metrics.get("hbm_memory_used_bytes", 0)
+    hbm_total = hw_metrics.get("hbm_memory_total_bytes", 1)
+    hbm_percent = (hbm_used / hbm_total) * 100 if isinstance(hbm_used, (int, float)) else "N/A"
+
+    report = {
+        "report_generated_at": time.ctime(),
+        "performance_metrics": {
+            "tokens_per_sec": round(tokens_per_sec, 2),
+            "total_queries_served": sw_metrics.get('vllm:request_success_total', 0),
+        },
+        "hardware_utilization": {
+            "dtype": "bfloat16",
+            "achieved_tflops": round(achieved_tflops, 2),
+            "mfu_percent": round(mfu_percent, 2),
+            "mxu_tensor_core_utilization_percent": hw_metrics.get("mxu_utilization"),
+            "hbm_utilization_percent": hbm_percent,
+            "sparse_cores_utilization_percent": hw_metrics.get("sparse_core_utilization"),
+            "cpu_to_tpu_pcie_tx_bytes": hw_metrics.get("pcie_bandwidth_tx"),
+            "cpu_to_tpu_pcie_rx_bytes": hw_metrics.get("pcie_bandwidth_rx"),
+        }
+    }
+    
+    # Upload to Cloud Storage
+    if GCS_BUCKET:
+        try:
+            filename = f"gemma3_v6e_report_{int(time.time())}.json"
+            with open(filename, 'w') as f:
+                json.dump(report, f, indent=4)
+                
+            client = storage.Client(project=PROJECT_ID)
+            bucket = client.bucket(GCS_BUCKET)
+            blob = bucket.blob(f"gemma3-vruns/{filename}")
+            blob.upload_from_filename(filename)
+            report["gcs_upload_status"] = f"Success: gs://{GCS_BUCKET}/gemma3-vruns/{filename}"
+        except Exception as e:
+            report["gcs_upload_status"] = f"Failed: {e}"
+
+    return report

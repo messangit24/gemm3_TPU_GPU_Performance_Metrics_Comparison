@@ -1,0 +1,235 @@
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: jetstream-llama70b
+  namespace: default
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 2  # leader + worker = 2 hosts × 4 chips = 8 v6e chips
+    restartPolicy: RecreateGroupOnPodRestart
+    leaderTemplate:
+      metadata:
+        labels:
+          app: jetstream-llama70b
+          role: leader
+        annotations:
+          # Forces both pods onto the same TPU slice so the GKE TPU webhook
+          # injects TPU_WORKER_HOSTNAMES correctly.
+          leaderworkerset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+      spec:
+        serviceAccountName: jetstream-sa
+        subdomain: jetstream-llama70b
+        nodeSelector:
+          cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+          cloud.google.com/gke-tpu-topology: 2x4
+          cloud.google.com/gke-nodepool: mb-tpu-v6e-multi-8
+        tolerations:
+        - key: "google.com/tpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+        containers:
+        - name: jetstream
+          image: europe-west4-docker.pkg.dev/mb-development-447000/ml-images/jetstream-maxtext:llama70b-v1
+          imagePullPolicy: Always
+          command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            echo "=============================================="
+            echo "LEADER (TPU_WORKER_ID=$TPU_WORKER_ID)"
+            echo "HOST: $(hostname)  IP: $(hostname -i)"
+            echo "TPU_WORKER_HOSTNAMES: $TPU_WORKER_HOSTNAMES"
+            echo "TPU_NAME: ${TPU_NAME:-unset}"
+            echo "=============================================="
+
+            # Sanity check
+            if [ -z "${TPU_WORKER_HOSTNAMES:-}" ]; then
+              echo "FATAL: TPU_WORKER_HOSTNAMES not set. Multi-host TPU webhook did not fire."
+              exit 1
+            fi
+
+            # Wait for peer DNS
+            echo "Waiting for all TPU peers to be DNS-resolvable..."
+            IFS=',' read -ra HOSTS <<< "$TPU_WORKER_HOSTNAMES"
+            for H in "${HOSTS[@]}"; do
+              for i in {1..120}; do
+                if getent hosts "$H" >/dev/null 2>&1; then
+                  echo "  ✓ $H -> $(getent hosts "$H" | awk '{print $1}')"
+                  break
+                fi
+                echo "  waiting for $H ... ($i)"
+                sleep 2
+              done
+            done
+
+            # Download tokenizer files from GCS to local disk.
+            # AutoTokenizer.from_pretrained() requires a local directory, not a gs:// URI.
+            echo "Downloading tokenizer to /tmp/tokenizer ..."
+            mkdir -p /tmp/tokenizer
+            gcloud storage cp gs://llama3-70b-maxtext/tokenizers/llama3.1-70b/* /tmp/tokenizer/
+            ls -la /tmp/tokenizer/
+            echo "Tokenizer downloaded."
+
+            # Launch JetStream HTTP/gRPC server with MaxText engine.
+            # JAX auto-discovers multi-host via TPU_WORKER_HOSTNAMES.
+            cd /workspace/maxtext
+            exec python3 -m maxtext.inference.maxengine.maxengine_server \
+              src/maxtext/configs/base.yml \
+              model_name=llama3.1-70b \
+              tokenizer_path=/tmp/tokenizer \
+              tokenizer_type=huggingface \
+              load_parameters_path=gs://llama3-70b-maxtext/checkpoints/llama3.1-70b-unscanned/0/items \
+              weight_dtype=bfloat16 \
+              dtype=bfloat16 \
+              ici_fsdp_parallelism=1 \
+              ici_tensor_parallelism=8 \
+              ici_autoregressive_parallelism=1 \
+              max_prefill_predict_length=1024 \
+              max_target_length=4096 \
+              per_device_batch_size=2 \
+              scan_layers=false \
+              async_checkpointing=false \
+              enable_checkpointing=true \
+              base_output_directory=/tmp/maxtext-output
+          ports:
+          - { name: http, containerPort: 9000 }
+          - { name: jax,  containerPort: 8476 }
+          env:
+          - { name: JAX_PLATFORMS,        value: tpu }
+          - { name: TF_CPP_MIN_LOG_LEVEL, value: "0" }
+          - { name: TPU_STDERR_LOG_LEVEL, value: "0" }
+          resources:
+            requests: { cpu: "16", memory: "100Gi" }
+            limits:   { cpu: "32", memory: "200Gi", google.com/tpu: "4" }
+          volumeMounts:
+          - { name: dshm, mountPath: /dev/shm }
+          - { name: tmp,  mountPath: /tmp }
+          startupProbe:
+            tcpSocket: { port: 9000 }
+            failureThreshold: 360       # 360 × 30s = 3 hours grace
+            periodSeconds: 30
+            timeoutSeconds: 10
+        volumes:
+        - { name: dshm, emptyDir: { medium: Memory, sizeLimit: 32Gi } }
+        - { name: tmp,  emptyDir: { sizeLimit: 50Gi } }
+
+    workerTemplate:
+      spec:
+        serviceAccountName: jetstream-sa
+        subdomain: jetstream-llama70b
+        nodeSelector:
+          cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+          cloud.google.com/gke-tpu-topology: 2x4
+          cloud.google.com/gke-nodepool: mb-tpu-v6e-multi-8
+        tolerations:
+        - key: "google.com/tpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+        containers:
+        - name: jetstream-worker
+          image: europe-west4-docker.pkg.dev/mb-development-447000/ml-images/jetstream-maxtext:llama70b-v1
+          imagePullPolicy: Always
+          command:
+          - bash
+          - -c
+          - |
+            set -euo pipefail
+            echo "=============================================="
+            echo "WORKER (TPU_WORKER_ID=$TPU_WORKER_ID)"
+            echo "HOST: $(hostname)  IP: $(hostname -i)"
+            echo "TPU_WORKER_HOSTNAMES: $TPU_WORKER_HOSTNAMES"
+            echo "=============================================="
+
+            if [ -z "${TPU_WORKER_HOSTNAMES:-}" ]; then
+              echo "FATAL: TPU_WORKER_HOSTNAMES not set on worker."
+              exit 1
+            fi
+
+            echo "Waiting for all TPU peers to be DNS-resolvable..."
+            IFS=',' read -ra HOSTS <<< "$TPU_WORKER_HOSTNAMES"
+            for H in "${HOSTS[@]}"; do
+              for i in {1..120}; do
+                if getent hosts "$H" >/dev/null 2>&1; then
+                  echo "  ✓ $H"
+                  break
+                fi
+                echo "  waiting for $H ... ($i)"
+                sleep 2
+              done
+            done
+
+            # Worker also needs the tokenizer locally — same download.
+            echo "Downloading tokenizer to /tmp/tokenizer ..."
+            mkdir -p /tmp/tokenizer
+            gcloud storage cp gs://llama3-70b-maxtext/tokenizers/llama3.1-70b/* /tmp/tokenizer/
+            ls -la /tmp/tokenizer/
+            echo "Tokenizer downloaded."
+
+            # Worker runs the same command. JAX uses TPU_WORKER_ID to differentiate.
+            # Only rank 0 (leader) accepts HTTP traffic on :9000.
+            cd /workspace/maxtext
+            exec python3 -m maxtext.inference.maxengine.maxengine_server \
+              src/maxtext/configs/base.yml \
+              model_name=llama3.1-70b \
+              tokenizer_path=/tmp/tokenizer \
+              tokenizer_type=huggingface \
+              load_parameters_path=gs://llama3-70b-maxtext/checkpoints/llama3.1-70b-unscanned/0/items \
+              weight_dtype=bfloat16 \
+              dtype=bfloat16 \
+              ici_fsdp_parallelism=1 \
+              ici_tensor_parallelism=8 \
+              ici_autoregressive_parallelism=1 \
+              max_prefill_predict_length=1024 \
+              max_target_length=4096 \
+              per_device_batch_size=2 \
+              scan_layers=false \
+              async_checkpointing=false \
+              enable_checkpointing=true \
+              base_output_directory=/tmp/maxtext-output
+          ports:
+          - { name: jax, containerPort: 8476 }
+          env:
+          - { name: JAX_PLATFORMS,        value: tpu }
+          - { name: TF_CPP_MIN_LOG_LEVEL, value: "0" }
+          - { name: TPU_STDERR_LOG_LEVEL, value: "0" }
+          resources:
+            requests: { cpu: "16", memory: "100Gi" }
+            limits:   { cpu: "32", memory: "200Gi", google.com/tpu: "4" }
+          volumeMounts:
+          - { name: dshm, mountPath: /dev/shm }
+          - { name: tmp,  mountPath: /tmp }
+        volumes:
+        - { name: dshm, emptyDir: { medium: Memory, sizeLimit: 32Gi } }
+        - { name: tmp,  emptyDir: { sizeLimit: 50Gi } }
+---
+# Headless service — REQUIRED for TPU_WORKER_HOSTNAMES DNS resolution.
+# Name MUST match `subdomain` field above.
+apiVersion: v1
+kind: Service
+metadata:
+  name: jetstream-llama70b
+  namespace: default
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    leaderworkerset.sigs.k8s.io/name: jetstream-llama70b
+  ports:
+  - { name: http, port: 9000, targetPort: 9000 }
+  - { name: jax,  port: 8476, targetPort: 8476 }
+---
+# Client-facing service — selects ONLY the leader pod
+apiVersion: v1
+kind: Service
+metadata:
+  name: jetstream-svc
+  namespace: default
+spec:
+  type: ClusterIP
+  selector:
+    app: jetstream-llama70b
+    role: leader
+  ports:
+  - { name: http, protocol: TCP, port: 9000, targetPort: 9000 }

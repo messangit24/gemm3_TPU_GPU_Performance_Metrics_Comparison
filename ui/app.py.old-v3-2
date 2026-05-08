@@ -1,0 +1,326 @@
+import streamlit as st
+from openai import OpenAI
+import PyPDF2
+import io
+import os
+import time
+import pandas as pd
+import plotly.express as px
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo 
+
+from metrics_helper import (
+    get_latest_mxu_utilization, 
+    calculate_derived_metrics, 
+    HARDWARE_SPECS, 
+    save_metrics_to_bigquery,
+    fetch_bigquery_metrics
+)
+
+VLLM_API_URL = os.getenv("VLLM_API_URL", "http://vllm-service:8000/v1")
+MODEL_NAME = "google/gemma-3-27b-it"
+LOCAL_TZ = ZoneInfo("America/New_York")
+
+client = OpenAI(base_url=VLLM_API_URL, api_key="not-needed", timeout=600.0)
+
+st.set_page_config(page_title="Gemma 3 TPU Dashboard", layout="wide")
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "session_metrics" not in st.session_state:
+    st.session_state.session_metrics = []
+
+def get_filtered_history(time_label, custom_start=None, custom_end=None):
+    now_utc = datetime.now(timezone.utc)
+    if time_label == "Last 5 Minutes":
+        start_time = now_utc - timedelta(minutes=5)
+    elif time_label == "Last 1 Hour":
+        start_time = now_utc - timedelta(hours=1)
+    elif time_label == "Last 24 Hours":
+        start_time = now_utc - timedelta(hours=24)
+    elif time_label == "Last 7 Days":
+        start_time = now_utc - timedelta(days=7)
+    elif time_label == "Last 30 Days":
+        start_time = now_utc - timedelta(days=30)
+    elif time_label == "Custom Range" and custom_start and custom_end:
+        start_local = datetime.combine(custom_start, datetime.min.time(), tzinfo=LOCAL_TZ)
+        end_local = datetime.combine(custom_end, datetime.max.time(), tzinfo=LOCAL_TZ)
+        return fetch_bigquery_metrics(start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc))
+    else:
+        start_time = now_utc - timedelta(hours=24)
+    return fetch_bigquery_metrics(start_time, now_utc)
+
+# ==========================================
+# PLOTLY CHART HELPER
+# ==========================================
+def plot_custom_chart(df, y_columns, title, chart_type='line', y_title="Value"):
+    """Generates a highly polished Plotly chart tailored for Streamlit."""
+    if len(df) == 1:
+        fig = px.scatter(df, x="query_timestamp", y=y_columns, title=title)
+        fig.update_traces(marker=dict(size=12, line=dict(width=2, color='DarkSlateGrey')))
+    else:
+        if chart_type == 'area':
+            fig = px.area(df, x="query_timestamp", y=y_columns, title=title)
+        elif chart_type == 'bar':
+            fig = px.bar(df, x="query_timestamp", y=y_columns, title=title, barmode='group')
+        else:
+            fig = px.line(df, x="query_timestamp", y=y_columns, title=title, markers=True)
+    
+    # Premium UI Formatting
+    fig.update_layout(
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        legend_title_text='',
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=0, r=0, t=40, b=0),
+        hovermode="x unified", # Creates a beautiful vertical line tooltip
+        xaxis_title="",
+        yaxis_title=y_title
+    )
+    fig.update_xaxes(showgrid=True, gridcolor='rgba(128, 128, 128, 0.2)', zeroline=False)
+    fig.update_yaxes(showgrid=True, gridcolor='rgba(128, 128, 128, 0.2)', zeroline=False)
+    
+    return fig
+
+# ==========================================
+# Sidebar
+# ==========================================
+st.sidebar.header("📄 Context Upload")
+uploaded_file = st.sidebar.file_uploader("Upload a file for context", type=["txt", "pdf", "csv"])
+file_context = ""
+
+if uploaded_file:
+    if uploaded_file.name.endswith(".pdf"):
+        pdf_reader = PyPDF2.PdfReader(io.BytesIO(uploaded_file.read()))
+        file_context = "".join([page.extract_text() for page in pdf_reader.pages])
+    else:
+        file_context = uploaded_file.getvalue().decode("utf-8")
+    st.sidebar.success("File loaded successfully!")
+
+st.sidebar.markdown("---")
+st.sidebar.header("⚙️ Hardware Profile")
+st.sidebar.markdown(f"**TPU Model:** {HARDWARE_SPECS['tpu_type']}")
+st.sidebar.markdown(f"**Data Type:** {HARDWARE_SPECS['dtype']}")
+st.sidebar.markdown(f"**Max Compute:** {HARDWARE_SPECS['peak_tflops']} TFLOPs")
+
+st.sidebar.markdown("---")
+if st.sidebar.button("🗑️ Clear Chat History"):
+    st.session_state.messages = []
+    st.session_state.session_metrics = []
+    st.rerun()
+
+# ==========================================
+# Main Layout
+# ==========================================
+col_chat, col_dash = st.columns([1.5, 1.2])
+
+with col_chat:
+    st.title("💬 Chatbot")
+    
+    chat_container = st.container(height=700)
+    with chat_container:
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+
+    if prompt := st.chat_input("Ask Gemma 3 anything..."):
+        
+        if file_context and len(st.session_state.messages) == 0:
+            full_prompt = f"Context:\n{file_context}\n\nQuestion: {prompt}"
+        else:
+            full_prompt = prompt
+
+        st.session_state.messages.append({"role": "user", "content": full_prompt})
+        
+        sanitized = []
+        for m in st.session_state.messages:
+            if not sanitized:
+                if m["role"] == "user":
+                    sanitized.append(m)
+            else:
+                if m["role"] != sanitized[-1]["role"]:
+                    sanitized.append(m)
+                else:
+                    sanitized[-1] = m
+                    
+        st.session_state.messages = sanitized
+        
+        with chat_container:
+            with st.chat_message("user"):
+                st.markdown(prompt)
+
+            with st.chat_message("assistant"):
+                message_placeholder = st.empty()
+                full_response = ""
+                start_time = time.time()
+                ttft_sec = 0.0
+                first_token_received = False
+                input_tokens = 0
+                output_tokens = 0
+                
+                try:
+                    response_stream = client.chat.completions.create(
+                        model=MODEL_NAME,
+                        messages=st.session_state.messages,
+                        stream=True,
+                        stream_options={"include_usage": True} 
+                    )
+                    
+                    for chunk in response_stream:
+                        if not first_token_received and len(chunk.choices) > 0 and chunk.choices[0].delta.content:
+                            ttft_sec = time.time() - start_time
+                            first_token_received = True
+
+                        if len(chunk.choices) > 0 and chunk.choices[0].delta.content:
+                            full_response += chunk.choices[0].delta.content
+                            message_placeholder.markdown(full_response + "▌")
+                        
+                        if chunk.usage:
+                            input_tokens = chunk.usage.prompt_tokens
+                            output_tokens = chunk.usage.completion_tokens
+                    
+                    message_placeholder.markdown(full_response)
+                except Exception as e:
+                    st.error(f"vLLM Generation Error: {e}")
+                    st.stop()
+                    
+                total_time_sec = time.time() - start_time
+                decode_time_sec = total_time_sec - ttft_sec
+
+        st.session_state.messages.append({"role": "assistant", "content": full_response})
+
+        tokens_sec, tflops, mfu = calculate_derived_metrics(output_tokens, total_time_sec)
+        mxu = get_latest_mxu_utilization()
+        timestamp_dt = datetime.now(timezone.utc)
+
+        metric_record = {
+            "query_timestamp": timestamp_dt,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "forward_time_sec": round(ttft_sec, 2),
+            "decode_time_sec": round(decode_time_sec, 2),
+            "total_time_sec": round(total_time_sec, 2),
+            "tokens_per_sec": tokens_sec,
+            "tflops": tflops,
+            "mfu_percent": mfu,
+            "mxu_percent": mxu
+        }
+
+        st.session_state.session_metrics.append(metric_record)
+        
+        success, save_err = save_metrics_to_bigquery(metric_record)
+        if not success:
+            st.toast(f"Note: Could not save to BigQuery. {save_err}", icon="⚠️")
+            
+        st.rerun()
+
+with col_dash:
+    st.title("📊 TPU Performance")
+    dash_container = st.container(height=750)
+    
+    with dash_container:
+        if st.session_state.session_metrics:
+            st.markdown("### Latest Query Speed")
+            latest = st.session_state.session_metrics[-1]
+            
+            t1, t2, t3 = st.columns(3)
+            t1.metric("Forward Time", f"{latest['forward_time_sec']} s")
+            t2.metric("Decode Time", f"{latest['decode_time_sec']} s")
+            t3.metric("Total Time", f"{latest['total_time_sec']} s")
+            
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Tokens/Sec", f"{latest['tokens_per_sec']} t/s")
+            m2.metric("MFU", f"{latest['mfu_percent']} %")
+            m3.metric("MXU", f"{latest['mxu_percent']} %")
+            st.markdown("---")
+            
+        st.markdown("### Historical Trends")
+        time_filter = st.selectbox(
+            "Select Timeframe",
+            ["Last 5 Minutes", "Last 1 Hour", "Last 24 Hours", "Last 7 Days", "Last 30 Days", "Custom Range"],
+            index=0
+        )
+        
+        custom_start, custom_end = None, None
+        if time_filter == "Custom Range":
+            c1, c2 = st.columns(2)
+            custom_start = c1.date_input("Start Date", value=datetime.today() - timedelta(days=7))
+            custom_end = c2.date_input("End Date", value=datetime.today())
+
+        bq_data, fetch_error = get_filtered_history(time_filter, custom_start, custom_end)
+        
+        if fetch_error:
+            st.warning(f"Could not load database history: {fetch_error}")
+        
+        df_bq = pd.DataFrame(bq_data) if bq_data else pd.DataFrame()
+        df_local = pd.DataFrame(st.session_state.session_metrics)
+        
+        if df_bq.empty and df_local.empty:
+            st.info("No metric data found for this timeframe.")
+        else:
+            df = pd.concat([df_bq, df_local], ignore_index=True)
+            
+            df['query_timestamp'] = pd.to_datetime(df['query_timestamp'], utc=True)
+            df['query_timestamp'] = df['query_timestamp'].dt.tz_convert(LOCAL_TZ)
+            df['query_timestamp'] = df['query_timestamp'].dt.tz_localize(None)
+            
+            df = df.drop_duplicates(subset=['query_timestamp'], keep='last')
+            df = df.sort_values(by="query_timestamp")
+            
+            # --- BEAUTIFUL PLOTLY CHARTS ---
+            
+            fig_timing = plot_custom_chart(df, ["forward_time_sec", "decode_time_sec", "total_time_sec"], "Timing & Latency", "line", "Seconds")
+            st.plotly_chart(fig_timing, use_container_width=True)
+
+            fig_tps = plot_custom_chart(df, ["tokens_per_sec"], "Throughput", "area", "Tokens / Sec")
+            st.plotly_chart(fig_tps, use_container_width=True)
+            
+            fig_tokens = plot_custom_chart(df, ["input_tokens", "output_tokens"], "Token Volume", "bar", "Tokens")
+            st.plotly_chart(fig_tokens, use_container_width=True)
+            
+            fig_hw = plot_custom_chart(df, ["mfu_percent", "mxu_percent"], "Hardware Utilization", "line", "Percent (%)")
+            st.plotly_chart(fig_hw, use_container_width=True)
+                
+            fig_flops = plot_custom_chart(df, ["tflops"], "Compute Performance", "area", "TFLOPs")
+            st.plotly_chart(fig_flops, use_container_width=True)
+
+            # --- STYLIZED DATAFRAME ---
+            st.subheader("Query Log")
+            
+            display_df = df[[
+                "query_timestamp", "input_tokens", "output_tokens", 
+                "forward_time_sec", "decode_time_sec", "total_time_sec", 
+                "tokens_per_sec", "tflops", "mfu_percent", "mxu_percent"
+            ]].copy()
+            
+            display_df['query_timestamp'] = display_df['query_timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
+            
+            display_df.rename(columns={
+                "query_timestamp": "Timestamp (EST)", 
+                "input_tokens": "Input Tokens", 
+                "output_tokens": "Output Tokens", 
+                "forward_time_sec": "Forward (s)",
+                "decode_time_sec": "Decode (s)",
+                "total_time_sec": "Total (s)", 
+                "tokens_per_sec": "Tokens/Sec",
+                "tflops": "TFLOPs",
+                "mfu_percent": "MFU (%)",
+                "mxu_percent": "MXU (%)"
+            }, inplace=True)
+            
+            display_df = display_df.set_index("Timestamp (EST)")
+            
+            # Apply a beautiful color gradient heatmap to the performance columns
+            styled_df = display_df.style.background_gradient(
+                cmap='Blues', subset=["Tokens/Sec", "TFLOPs"]
+            ).format({
+                "Forward (s)": "{:.2f}",
+                "Decode (s)": "{:.2f}",
+                "Total (s)": "{:.2f}",
+                "Tokens/Sec": "{:.2f}",
+                "TFLOPs": "{:.2f}",
+                "MFU (%)": "{:.2f}",
+                "MXU (%)": "{:.2f}"
+            })
+            
+            st.dataframe(styled_df, use_container_width=True)

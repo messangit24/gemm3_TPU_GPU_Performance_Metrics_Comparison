@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gemma3-27b-vllm
+  labels:
+    app: gemma3-vllm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gemma3-vllm
+  template:
+    metadata:
+      labels:
+        app: gemma3-vllm
+    spec:
+      nodeSelector:
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: 2x2
+        cloud.google.com/gke-nodepool: mb-tpu-v6e-4
+
+      containers:
+      - name: vllm-tpu
+        image: vllm/vllm-tpu:latest 
+        command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+        args:
+          - "--model=google/gemma-3-27b-it"
+          - "--tensor-parallel-size=4"
+          - "--max-model-len=8192"
+          - "--dtype=bfloat16"
+          - "--port=8000"
+          - "--trust-remote-code"
+        env:
+        - name: HUGGING_FACE_HUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+        - name: XLA_METRICS_DIR
+          value: "/metrics_output"
+        - name: PT_XLA_DEBUG
+          value: "1"
+        ports:
+        - containerPort: 8000
+        resources:
+          limits:
+            google.com/tpu: "4" 
+        volumeMounts:
+        - name: metrics-volume
+          mountPath: /metrics_output
+      volumes:
+      - name: metrics-volume
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-service
+  annotations:
+    # Use an internal load balancer to keep traffic inside your VPC
+    networking.gke.io/load-balancer-type: "Internal"
+spec:
+  selector:
+    app: gemma3-vllm
+  ports:
+    - protocol: TCP
+      port: 8000
+      targetPort: 8000
+  type: LoadBalancer

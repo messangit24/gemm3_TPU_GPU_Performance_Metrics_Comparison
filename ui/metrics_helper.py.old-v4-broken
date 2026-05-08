@@ -1,0 +1,251 @@
+import os
+import time
+from datetime import datetime, timezone
+from google.cloud import monitoring_v3
+from google.cloud import bigquery
+from google.protobuf.timestamp_pb2 import Timestamp
+
+PROJECT_ID  = os.getenv("PROJECT_ID")
+CLUSTER_NAME = os.getenv("CLUSTER_NAME")
+BQ_DATASET  = os.getenv("BQ_DATASET", "tpu_metrics")
+BQ_LOCATION  = os.getenv("BQ_LOCATION", "europe-west4")
+
+
+def get_latest_hardware_utilization() -> float:
+    """
+    Fetch the most recent accelerator duty_cycle datapoint from
+    Cloud Monitoring across all pods in the configured cluster.
+    Returns 0.0 on any error or misconfiguration.
+    """
+    if not PROJECT_ID or not CLUSTER_NAME:
+        print("get_latest_hardware_utilization: PROJECT_ID or CLUSTER_NAME not set.")
+        return 0.0
+
+    client = monitoring_v3.MetricServiceClient()
+    project_name = f"projects/{}"   # ← FIXED
+
+    now = time.time()
+    start_ts = Timestamp()
+    start_ts.FromSeconds(int(now - 300))
+    end_ts = Timestamp()
+    end_ts.FromSeconds(int(now))
+
+    interval = monitoring_v3.TimeInterval(
+        {"start_time": start_ts, "end_time": end_ts}
+    )
+
+    try:
+        results = client.list_time_series(
+            request={
+                "name": project_name,
+                "filter": (                              # ← FIXED
+                    'metric.type = "kubernetes.io/container/accelerator/duty_cycle"'
+                    f' AND resource.labels.cluster_name = "{}"'
+                ),
+                "interval": interval,
+                "view": monitoring_v3.ListTimeSeriesRequest.TimeSeriesView.FULL,
+            }
+        )
+
+        latest_time = 0.0
+        latest_val  = 0.0
+
+        for series in results:
+            for point in series.points:
+                pt_time = point.interval.end_time.timestamp()
+                if pt_time > latest_time:
+                    latest_time = pt_time
+                    # double_value is 0.0 when unset, so check int first
+                    val = point.value.int64_value or point.value.double_value
+                    latest_val = float(val)
+
+        return round(latest_val, 2)
+
+    except Exception as e:
+        print(f"GCP Metrics Error: {}")
+        return 0.0
+
+
+def calculate_derived_metrics(
+    output_tokens: int,
+    total_time_sec: float,
+    decode_time_sec: float,
+    num_chips: int,
+    param_count: int,
+    peak_tflops: float,
+    peak_mem_bw: float,
+) -> tuple[float, float, float, float, float]:
+    """
+    Returns (tokens_per_sec, tpot_sec, achieved_tflops, mfu_percent, mbu_percent).
+    All values are 0.0 when inputs are degenerate.
+    """
+    if total_time_sec <= 0 or output_tokens == 0:
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+
+    tokens_per_sec = output_tokens / total_time_sec
+
+    if decode_time_sec > 0:
+        decode_tps = output_tokens / decode_time_sec
+        tpot_sec   = decode_time_sec / output_tokens
+    else:
+        decode_tps = tokens_per_sec
+        tpot_sec   = 0.0
+
+    # 2 FLOPs per param per token (multiply-accumulate)
+    achieved_tflops  = (2 * param_count * tokens_per_sec) / 1e12
+    total_peak_tflops = peak_tflops * num_chips
+    mfu_percent       = (achieved_tflops / total_peak_tflops) * 100
+
+    # MBU: bfloat16 = 2 bytes/param
+    achieved_mem_bw_bytes = param_count * 2 * decode_tps
+    total_peak_bw_bytes   = peak_mem_bw * num_chips * 1e12
+    mbu_percent           = (achieved_mem_bw_bytes / total_peak_bw_bytes) * 100
+
+    return (
+        round(tokens_per_sec, 2),
+        round(tpot_sec, 3),
+        round(achieved_tflops, 2),
+        round(mfu_percent, 2),
+        round(mbu_percent, 2),
+    )
+
+
+def save_metrics_to_bigquery(
+    metric_data: dict,
+    table_name: str,
+    util_column_name: str,
+) -> tuple[bool, str]:
+    """
+    Insert one metric row into BigQuery.
+    util_column_name is the hardware-specific column
+    (e.g. 'mxu_percent' or 'sm_utilization_percent').
+    """
+    if not PROJECT_ID:
+        return False, "PROJECT_ID env var is not set."
+
+    # Guard: only allow known column names to prevent SQL injection
+    ALLOWED_UTIL_COLUMNS = {"mxu_percent", "sm_utilization_percent"}
+    if util_column_name not in ALLOWED_UTIL_COLUMNS:
+        return False, f"Unknown util_column_name: {util_column_name!r}"
+
+    try:
+        client   = bigquery.Client(project=PROJECT_ID, location=BQ_LOCATION)
+        table_id = f"{}.{}.{}"   # ← FIXED
+
+        query = f"""
+            INSERT INTO `{}`
+            (
+                query_timestamp, input_tokens, output_tokens,
+                forward_time_sec, decode_time_sec, total_time_sec,
+                tokens_per_sec, tflops, mfu_percent,
+                {},
+                model_name, parameter_size, tpot_sec, mbu_percent
+            )
+            VALUES (
+                @query_timestamp, @input_tokens, @output_tokens,
+                @forward_time_sec, @decode_time_sec, @total_time_sec,
+                @tokens_per_sec, @tflops, @mfu_percent,
+                @util_val,
+                @model_name, @parameter_size, @tpot_sec, @mbu_percent
+            )
+        """   # ← FIXED: util_column_name now correctly interpolated
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter(
+                    "query_timestamp", "TIMESTAMP", metric_data["query_timestamp"]
+                ),
+                bigquery.ScalarQueryParameter(
+                    "input_tokens", "INT64", metric_data["input_tokens"]
+                ),
+                bigquery.ScalarQueryParameter(
+                    "output_tokens", "INT64", metric_data["output_tokens"]
+                ),
+                bigquery.ScalarQueryParameter(
+                    "forward_time_sec", "FLOAT64", metric_data["forward_time_sec"]
+                ),
+                bigquery.ScalarQueryParameter(
+                    "decode_time_sec", "FLOAT64", metric_data["decode_time_sec"]
+                ),
+                bigquery.ScalarQueryParameter(
+                    "total_time_sec", "FLOAT64", metric_data["total_time_sec"]
+                ),
+                bigquery.ScalarQueryParameter(
+                    "tokens_per_sec", "FLOAT64", metric_data["tokens_per_sec"]
+                ),
+                bigquery.ScalarQueryParameter(
+                    "tflops", "FLOAT64", metric_data["tflops"]
+                ),
+                bigquery.ScalarQueryParameter(
+                    "mfu_percent", "FLOAT64", metric_data["mfu_percent"]
+                ),
+                bigquery.ScalarQueryParameter(
+                    "util_val", "FLOAT64", float(metric_data.get("hw_utilization", 0.0))
+                ),
+                bigquery.ScalarQueryParameter(
+                    "model_name", "STRING", metric_data.get("model_name", "Unknown")
+                ),
+                bigquery.ScalarQueryParameter(
+                    "parameter_size", "STRING", metric_data.get("parameter_size", "Unknown")
+                ),
+                bigquery.ScalarQueryParameter(
+                    "tpot_sec", "FLOAT64", float(metric_data.get("tpot_sec", 0.0))
+                ),
+                bigquery.ScalarQueryParameter(
+                    "mbu_percent", "FLOAT64", float(metric_data.get("mbu_percent", 0.0))
+                ),
+            ]
+        )
+
+        job = client.query(query, job_config=job_config)
+        job.result()   # blocks until complete
+        return True, ""
+
+    except Exception as e:
+        return False, str(e)
+
+
+def fetch_bigquery_metrics(
+    start_time_utc: datetime,
+    table_name: str,
+    end_time_utc: datetime | None = None,
+) -> tuple[list[dict], str]:
+    """
+    Return all metric rows between start_time_utc and end_time_utc
+    from the specified BigQuery table.
+    """
+    if not PROJECT_ID:
+        return [], "PROJECT_ID env var is not set."
+
+    if end_time_utc is None:
+        end_time_utc = datetime.now(timezone.utc)
+
+    try:
+        client   = bigquery.Client(project=PROJECT_ID, location=BQ_LOCATION)
+        table_id = f"{}.{}.{}"   # ← FIXED
+
+        query = f"""
+            SELECT *
+            FROM `{}`
+            WHERE query_timestamp >= @start_time
+              AND query_timestamp <= @end_time
+            ORDER BY query_timestamp ASC
+        """
+
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter(
+                    "start_time", "TIMESTAMP", start_time_utc
+                ),
+                bigquery.ScalarQueryParameter(
+                    "end_time", "TIMESTAMP", end_time_utc
+                ),
+            ]
+        )
+
+        job     = client.query(query, job_config=job_config)
+        results = job.result()
+        return [dict(row) for row in results], ""
+
+    except Exception as e:
+        return [], str(e)

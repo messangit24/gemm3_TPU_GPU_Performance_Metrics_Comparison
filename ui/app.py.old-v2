@@ -1,0 +1,96 @@
+import streamlit as st
+from openai import OpenAI
+import PyPDF2
+import io
+import os
+import time
+import json
+
+# Import your custom modules
+from run_batch_inference import run_load_test
+from generate_final_report import generate_report
+
+VLLM_API_URL = os.getenv("VLLM_API_URL", "http://vllm-service:8000/v1")
+MODEL_NAME = "google/gemma-3-27b-it"
+
+client = OpenAI(base_url=VLLM_API_URL, api_key="not-needed")
+
+st.set_page_config(page_title="Gemma 3 27B Chat & Testing", layout="wide")
+st.title("Gemma 3 27B - Trillium TPU v6e")
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# ==========================================
+# Sidebar: File Upload & Load Testing
+# ==========================================
+st.sidebar.header("📄 Context Upload")
+uploaded_file = st.sidebar.file_uploader("Upload a file for context", type=["txt", "pdf", "csv"])
+file_context = ""
+
+if uploaded_file:
+    if uploaded_file.name.endswith(".pdf"):
+        pdf_reader = PyPDF2.PdfReader(io.BytesIO(uploaded_file.read()))
+        file_context = "".join([page.extract_text() for page in pdf_reader.pages])
+    else:
+        file_context = uploaded_file.getvalue().decode("utf-8")
+    st.sidebar.success("File loaded successfully!")
+
+st.sidebar.markdown("---")
+st.sidebar.header("🚀 Performance Load Test")
+load_prompt = st.sidebar.text_area("Load Test Prompt", "Explain the theory of general relativity in detail.")
+num_requests = st.sidebar.number_input("Number of Requests", min_value=1, max_value=500, value=50)
+
+if st.sidebar.button("Start Load Test & Generate Metrics"):
+    # 1. Run the inference load
+    with st.spinner(f"Running {num_requests} concurrent requests..."):
+        duration = run_load_test(VLLM_API_URL, MODEL_NAME, load_prompt, num_requests)
+        st.sidebar.success(f"Load test completed in {duration:.2f}s!")
+    
+    # 2. Wait for Cloud Monitoring to ingest TPU hardware metrics
+    with st.spinner("Waiting 60s for metrics to flush to GCP Monitoring..."):
+        time.sleep(60)
+        
+    # 3. Generate and upload the report
+    with st.spinner("Generating hardware report and saving to GCS..."):
+        report = generate_report()
+        st.sidebar.success("Report Generated!")
+        st.sidebar.download_button(
+            label="Download Metrics JSON",
+            data=json.dumps(report, indent=4),
+            file_name="gemma3_v6e_final_report.json",
+            mime="application/json"
+        )
+
+# ==========================================
+# Main Window: Standard Chat
+# ==========================================
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+if prompt := st.chat_input("Ask Gemma 3 anything..."):
+    if file_context and len(st.session_state.messages) == 0:
+        full_prompt = f"Context:\n{file_context}\n\nQuestion: {prompt}"
+    else:
+        full_prompt = prompt
+
+    st.session_state.messages.append({"role": "user", "content": full_prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        message_placeholder = st.empty()
+        full_response = ""
+        
+        for response in client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=st.session_state.messages,
+            stream=True,
+        ):
+            full_response += (response.choices[0].delta.content or "")
+            message_placeholder.markdown(full_response + "▌")
+        
+        message_placeholder.markdown(full_response)
+    
+    st.session_state.messages.append({"role": "assistant", "content": full_response})

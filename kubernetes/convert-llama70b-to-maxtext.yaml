@@ -1,0 +1,61 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: convert-llama70b-maxtext
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: converter
+        image: us-docker.pkg.dev/cloud-tpu-images/inference/maxtext-jetstream:latest
+        command:
+        - bash
+        - -c
+        - |
+          set -euo pipefail
+
+          echo "===== Step 1: Download Llama-3.1-70B from HuggingFace ====="
+          mkdir -p /scratch/hf
+          python3 -c "
+          from huggingface_hub import snapshot_download
+          import os
+          snapshot_download(
+              repo_id='meta-llama/Llama-3.1-70B-Instruct',
+              local_dir='/scratch/hf/llama3.1-70b',
+              token=os.environ['HF_TOKEN'],
+              max_workers=4,
+          )
+          "
+
+          echo "===== Step 2: Convert HF -> MaxText (unscanned) ====="
+          # MaxText's convert script for Llama-3.1
+          cd /deps/MaxText
+          python3 -m MaxText.convert_hf_checkpoint \
+            --base_model_path=/scratch/hf/llama3.1-70b \
+            --maxtext_model_path=/scratch/maxtext/llama3.1-70b-unscanned \
+            --model_size=llama3.1-70b
+
+          echo "===== Step 3: Upload to GCS ====="
+          gcloud storage cp -r /scratch/maxtext/llama3.1-70b-unscanned \
+            gs://${BUCKET_NAME}/checkpoints/llama3.1-70b-unscanned/
+
+          echo "===== Done. ====="
+        env:
+        - name: BUCKET_NAME
+          value: "llama3-70b-maxtext"  # ← edit
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef: { name: hf-token, key: HF_TOKEN }
+        - name: HF_HOME
+          value: /scratch/hf
+        resources:
+          requests: { cpu: "8", memory: "64Gi" }
+          limits:   { cpu: "16", memory: "128Gi" }
+        volumeMounts:
+        - { name: scratch, mountPath: /scratch }
+      volumes:
+      - name: scratch
+        emptyDir: { sizeLimit: 400Gi }

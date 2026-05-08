@@ -1,0 +1,129 @@
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: llama3-70b-8tpu
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 2  
+    restartPolicy: RecreateGroupOnPodRestart
+    leaderTemplate:
+      metadata:
+        labels:
+          app: llama3-8tpu
+          role: leader
+      spec:
+        nodeSelector:
+          cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+          cloud.google.com/gke-tpu-topology: 2x4  
+        volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: "150Gi"
+        containers:
+        - name: jetstream-leader
+          # Fix: Using the explicit v0.2.4 tag
+          image: us-docker.pkg.dev/cloud-tpu-images/inference/jetstream-pytorch:v0.2.4
+          volumeMounts:
+          - mountPath: /dev/shm
+            name: dshm
+          command:
+            - sh
+            - -c
+            - |
+              # 1. Start the Ray Head Node to bridge the TPUs
+              POD_IP=$(hostname -i | awk '{print $1}')
+              ray start --head --node-ip-address=$POD_IP --port=6379
+              export RAY_ADDRESS="$POD_IP:6379"
+              
+              echo "Waiting 15 seconds for the worker pod to join the Ray mesh..."
+              sleep 15
+              
+              # 2. Start the native JetStream engine in the background (gRPC on port 9000)
+              jpt serve --model_id meta-llama/Llama-3.1-70B-Instruct \
+                --hf_token=$HUGGING_FACE_HUB_TOKEN \
+                --port=9000 &
+              
+              echo "Waiting 30 seconds for the JetStream engine to initialize..."
+              sleep 30
+              
+              # 3. Start the JetStream OpenAI Proxy on port 8000 to maintain app.py compatibility
+              python -m jetstream.third_party.openai_api.api_server \
+                --host 0.0.0.0 \
+                --port 8000 \
+                --model meta-llama/Llama-3.1-70B-Instruct
+          ports:
+            - containerPort: 8000
+          resources:
+            limits:
+              google.com/tpu: "4"
+          env:
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+    workerTemplate:
+      spec:
+        nodeSelector:
+          cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+          cloud.google.com/gke-tpu-topology: 2x4  
+        volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: "150Gi"
+        containers:
+        - name: jetstream-worker
+          image: us-docker.pkg.dev/cloud-tpu-images/inference/jetstream-pytorch:v0.2.4
+          volumeMounts:
+          - mountPath: /dev/shm
+            name: dshm
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting 10 seconds for leader Ray Head to boot..."
+              sleep 10
+              
+              # Worker ONLY joins the Ray cluster. JetStream on the leader controls it remotely.
+              ray start --address=${LWS_LEADER_ADDRESS}:6379 --block
+          resources:
+            limits:
+              google.com/tpu: "4"
+          env:
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+---
+# ==========================================
+# The Headless Service (Ray DNS Routing)
+# ==========================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: llama3-70b-8tpu
+spec:
+  clusterIP: None
+  selector:
+    leaderworkerset.sigs.k8s.io/name: llama3-70b-8tpu
+---
+# ==========================================
+# The UI Service (Streamlit Traffic)
+# Keeping the 'vllm' name so app.py doesn't break
+# ==========================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-service-8tpu
+spec:
+  selector:
+    app: llama3-8tpu
+    role: leader
+  ports:
+    - protocol: TCP
+      port: 8000
+      targetPort: 8000

@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gemma-ui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gemma-ui
+  template:
+    metadata:
+      labels:
+        app: gemma-ui
+    spec:
+      nodeSelector:
+        cloud.google.com/gke-nodepool: default-pool # Targets CPU pool
+      containers:
+      - name: ui
+        image: europe-west4-docker.pkg.dev/mb-development-447000/gemmatpu/gemma-ui:latest
+        env:
+        - name: VLLM_API_URL
+          value: "http://vllm-service:8000/v1"
+        - name: VLLM_METRICS_URL
+          value: "http://vllm-service:8000/metrics"
+        - name: PROJECT_ID
+          value: "mb-development-447000"
+        - name: CLUSTER_NAME
+          value: "mb-tpu-benchmark"
+        - name: GCS_BUCKET
+          value: "messan-gemmatpu"
+        ports:
+        - containerPort: 8501
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gemma-ui-service
+spec:
+  selector:
+    app: gemma-ui
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 8501
+  type: LoadBalancer

@@ -1,0 +1,1023 @@
+import streamlit as st
+from openai import OpenAI
+import PyPDF2
+import io
+import os
+import time
+import httpx
+import pandas as pd
+import plotly.express as px
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+from metrics_helper import (
+    get_latest_hardware_utilization,
+    calculate_derived_metrics,
+    save_metrics_to_bigquery,
+    fetch_bigquery_metrics,
+)
+
+# ==========================================
+# Configuration & Deployment Router
+# ==========================================
+DEPLOYMENTS = {
+    "Gemma 3 27B (4x TPU v6e)": {
+        "url": os.getenv("VLLM_API_URL_4", "http://vllm-service:8000/v1"),
+        "chips": 4,
+        "model_name": "google/gemma-3-27b-it",
+        "parameter_size": "27B",
+        "parameter_count": 27 * (10**9),
+        "peak_tflops": 394,
+        "peak_mem_bw": 1.6,
+        "bq_table": "gemma3_logs",
+        "hw_label": "Trillium v6e",
+        "util_column": "mxu_percent",
+        "util_label": "MXU (%)",
+    },
+    "Gemma 3 27B (4x A100 GPU)": {
+        "url": os.getenv("VLLM_API_URL_GPU", "http://vllm-service-a100:8000/v1"),
+        "chips": 4,
+        "model_name": "google/gemma-3-27b-it",
+        "parameter_size": "27B",
+        "parameter_count": 27 * (10**9),
+        "peak_tflops": 312,
+        "peak_mem_bw": 1.55,
+        "bq_table": "gemma3_gpu_logs",
+        "hw_label": "NVIDIA A100",
+        "util_column": "sm_utilization_percent",
+        "util_label": "SM Util (%)",
+    },
+    "Llama 3.1 70B (8x TPU v6e)": {
+        "url": os.getenv("VLLM_API_URL_8", "http://vllm-service-8tpu:8000/v1"),
+        "chips": 8,
+        "model_name": "meta-llama/Llama-3.1-70B-Instruct",
+        "parameter_size": "70B",
+        "parameter_count": 70 * (10**9),
+        "peak_tflops": 394,
+        "peak_mem_bw": 1.6,
+        "bq_table": "llama3_logs",
+        "hw_label": "Trillium v6e",
+        "util_column": "mxu_percent",
+        "util_label": "MXU (%)",
+    },
+}
+
+LOCAL_TZ = ZoneInfo("America/New_York")
+
+# ==========================================
+# Page Config — must be first Streamlit call
+# ==========================================
+st.set_page_config(
+    page_title="LLM Inference Dashboard",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# ==========================================
+# Custom CSS
+# ==========================================
+st.markdown(
+    """
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Product+Sans:wght@400;700&display=swap');
+
+  [data-testid="stAppViewBlockContainer"] {
+    padding-top: 2rem !important;
+    padding-bottom: 1rem !important;
+  }
+
+  [data-testid="stDecoration"] {
+    display: none;
+  }
+
+  [data-testid="stHeader"] {
+    background-color: transparent;
+  }
+
+  .custom-header {
+    font-family: 'Product Sans', sans-serif;
+    font-weight: 700;
+    font-size: 2rem;
+    margin-bottom: 15px;
+  }
+
+  .top-bar-container {
+    display: flex;
+    align-items: center;
+    gap: 15px;
+    margin-bottom: 15px;
+  }
+
+  .top-bar-container img {
+    width: 38px;
+    height: 38px;
+  }
+
+  .top-bar-container h1 {
+    font-family: 'Product Sans', sans-serif;
+    font-weight: 700;
+    font-size: 2.2rem;
+    margin: 0;
+    padding: 0;
+    line-height: 1;
+  }
+
+  .status-badge {
+    display: inline-block;
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    margin-left: 8px;
+  }
+
+  .status-online  { background-color: #d4edda; color: #155724; }
+  .status-offline { background-color: #f8d7da; color: #721c24; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+# ── Top Bar ────────────────────────────────────────────────────────
+st.markdown(
+    """
+<div class="top-bar-container">
+  <img
+    src="https://upload.wikimedia.org/wikipedia/commons/thumb/c/c1/Google_%22G%22_logo.svg/120px-Google_%22G%22_logo.svg.png"
+    alt="Google G"
+  >
+  <h1>LLM Inference Dashboard</h1>
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+# ==========================================
+# Session State Initialisation
+# ==========================================
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "session_metrics" not in st.session_state:
+    st.session_state.session_metrics = []
+if "last_deployment" not in st.session_state:
+    st.session_state.last_deployment = None
+
+
+# ==========================================
+# Helper: Endpoint Health Check
+# ==========================================
+def check_endpoint_health(url: str) -> tuple[bool, str]:
+    """
+    Attempt a GET /health against the inference endpoint.
+    Returns (is_healthy, error_message).
+    """
+    try:
+        health_url = url.replace("/v1", "") + "/health"
+        r = httpx.get(health_url, timeout=5.0)
+        return r.status_code == 200, ""
+    except httpx.ConnectError:
+        return False, "Connection refused — pod may still be loading."
+    except httpx.TimeoutException:
+        return False, "Health check timed out."
+    except Exception as e:
+        return False, str(e)
+
+
+# ==========================================
+# Helper: Timeframe → BigQuery fetch
+# ==========================================
+def get_filtered_history(
+    time_label: str,
+    endpoint_cfg: dict,
+    custom_start=None,
+    custom_end=None,
+) -> tuple[list[dict], str]:
+    now_utc = datetime.now(timezone.utc)
+
+    if time_label == "Last 5 Minutes":
+        start_time = now_utc - timedelta(minutes=5)
+    elif time_label == "Last 1 Hour":
+        start_time = now_utc - timedelta(hours=1)
+    elif time_label == "Last 24 Hours":
+        start_time = now_utc - timedelta(hours=24)
+    elif time_label == "Last 7 Days":
+        start_time = now_utc - timedelta(days=7)
+    elif time_label == "Last 30 Days":
+        start_time = now_utc - timedelta(days=30)
+    elif time_label == "Custom Range" and custom_start and custom_end:
+        start_local = datetime.combine(
+            custom_start, datetime.min.time(), tzinfo=LOCAL_TZ
+        )
+        end_local = datetime.combine(
+            custom_end, datetime.max.time(), tzinfo=LOCAL_TZ
+        )
+        return fetch_bigquery_metrics(
+            start_local.astimezone(timezone.utc),
+            endpoint_cfg["bq_table"],
+            end_local.astimezone(timezone.utc),
+        )
+    else:
+        start_time = now_utc - timedelta(hours=24)
+
+    return fetch_bigquery_metrics(start_time, endpoint_cfg["bq_table"], now_utc)
+
+
+# ==========================================
+# Helper: Plotly Chart Factory
+# ==========================================
+def plot_custom_chart(
+    df: pd.DataFrame,
+    y_columns: list[str],
+    title: str,
+    chart_type: str = "line",
+    y_title: str = "Value",
+    color_col: str | None = None,
+) -> px.Figure:
+    """
+    Render a Plotly figure using the shared dashboard style.
+    Falls back to scatter when only one data point exists.
+    """
+    # Single data-point guard — line/area charts look broken with 1 point
+    if len(df) == 1:
+        fig = px.scatter(
+            df, x="query_timestamp", y=y_columns, title=title, color=color_col
+        )
+        fig.update_traces(
+            marker=dict(size=12, line=dict(width=2, color="DarkSlateGrey"))
+        )
+    else:
+        if chart_type == "area":
+            fig = px.area(
+                df,
+                x="query_timestamp",
+                y=y_columns,
+                title=title,
+                color=color_col,
+            )
+        elif chart_type == "bar":
+            fig = px.bar(
+                df,
+                x="query_timestamp",
+                y=y_columns,
+                title=title,
+                barmode="group",
+                color=color_col,
+            )
+        else:
+            fig = px.line(
+                df,
+                x="query_timestamp",
+                y=y_columns,
+                title=title,
+                markers=True,
+                color=color_col,
+            )
+
+    fig.update_layout(
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        legend_title_text="",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        margin=dict(l=0, r=0, t=40, b=0),
+        hovermode="x unified",
+        xaxis_title="",
+        yaxis_title=y_title,
+    )
+    fig.update_xaxes(
+        showgrid=True, gridcolor="rgba(128, 128, 128, 0.2)", zeroline=False
+    )
+    fig.update_yaxes(
+        showgrid=True, gridcolor="rgba(128, 128, 128, 0.2)", zeroline=False
+    )
+    return fig
+
+
+# ==========================================
+# Helper: Build & de-duplicate metrics DataFrame
+# ==========================================
+def build_metrics_dataframe(
+    bq_data: list[dict],
+    session_data: list[dict],
+    util_col: str,
+    util_label: str,
+) -> pd.DataFrame:
+    """
+    Merge BigQuery history with in-session metrics, de-duplicate,
+    rename columns for display, and return a sorted DataFrame.
+    """
+    df_bq = pd.DataFrame(bq_data) if bq_data else pd.DataFrame()
+    df_local = pd.DataFrame(session_data) if session_data else pd.DataFrame()
+
+    if df_bq.empty and df_local.empty:
+        return pd.DataFrame()
+
+    df = pd.concat([df_bq, df_local], ignore_index=True)
+
+    # Normalise timestamps → local tz → tz-naive for Plotly
+    df["query_timestamp"] = pd.to_datetime(df["query_timestamp"], utc=True)
+    df["query_timestamp"] = df["query_timestamp"].dt.tz_convert(LOCAL_TZ)
+    df["query_timestamp"] = df["query_timestamp"].dt.tz_localize(None)
+
+    df = df.drop_duplicates(subset=["query_timestamp"], keep="last")
+    df = df.sort_values("query_timestamp").reset_index(drop=True)
+
+    # Ensure all expected columns exist before renaming
+    for col, default in [
+        ("tpot_sec", 0.0),
+        ("mbu_percent", 0.0),
+        (util_col, 0.0),
+    ]:
+        if col not in df.columns:
+            df[col] = default
+
+    # hw_utilization (live metric) overrides the BQ column if both present
+    if "hw_utilization" in df.columns:
+        df[util_col] = df["hw_utilization"].combine_first(df[util_col])
+
+    df["tpot_sec"] = df["tpot_sec"].fillna(0.0)
+    df["mbu_percent"] = df["mbu_percent"].fillna(0.0)
+    df[util_col] = df[util_col].fillna(0.0)
+
+    df.rename(
+        columns={
+            "forward_time_sec": "TTFT (s)",
+            "tpot_sec": "TPOT (s)",
+            "total_time_sec": "Total (s)",
+            "tokens_per_sec": "Tokens/Sec",
+            "input_tokens": "Input Tokens",
+            "output_tokens": "Output Tokens",
+            "mfu_percent": "MFU (%)",
+            "mbu_percent": "MBU (%)",
+            util_col: util_label,
+            "tflops": "TFLOPs",
+            "model_name": "Model",
+            "parameter_size": "Params",
+        },
+        inplace=True,
+    )
+
+    return df
+
+
+# ==========================================
+# Sidebar
+# ==========================================
+st.sidebar.header("🚀 Model Routing")
+selected_deployment = st.sidebar.selectbox(
+    "Select Endpoint:",
+    list(DEPLOYMENTS.keys()),
+    label_visibility="collapsed",
+)
+endpoint_config = DEPLOYMENTS[selected_deployment]
+
+# Clear chat history when the user switches deployment
+if st.session_state.last_deployment != selected_deployment:
+    st.session_state.messages = []
+    st.session_state.session_metrics = []
+    st.session_state.last_deployment = selected_deployment
+
+# ── Endpoint health badge ──────────────────────────────────────────
+with st.sidebar:
+    with st.spinner("Checking endpoint health…"):
+        is_healthy, health_err = check_endpoint_health(endpoint_config["url"])
+
+    if is_healthy:
+        st.markdown(
+            '<span class="status-badge status-online">● Endpoint Online</span>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f'<span class="status-badge status-offline">● Offline — {health_err}</span>',
+            unsafe_allow_html=True,
+        )
+
+st.sidebar.markdown("---")
+
+# ── Document upload ────────────────────────────────────────────────
+st.sidebar.header("📄 Upload Document")
+uploaded_file = st.sidebar.file_uploader(
+    "Upload a file for context", type=["txt", "pdf", "csv"]
+)
+file_context = ""
+
+if uploaded_file:
+    if uploaded_file.name.endswith(".pdf"):
+        pdf_reader = PyPDF2.PdfReader(io.BytesIO(uploaded_file.read()))
+        file_context = "".join(
+            page.extract_text() or "" for page in pdf_reader.pages
+        )
+    else:
+        file_context = uploaded_file.getvalue().decode("utf-8")
+
+    if file_context.strip():
+        st.sidebar.success(
+            f"✅ Loaded **{uploaded_file.name}** "
+            f"({len(file_context):,} chars)"
+        )
+    else:
+        st.sidebar.warning("File loaded but appears to be empty.")
+
+st.sidebar.markdown("---")
+
+# ── Hardware profile ───────────────────────────────────────────────
+st.sidebar.header("⚙️ Active Hardware Profile")
+st.sidebar.markdown(
+    f"**Model:** {endpoint_config['model_name']} ({endpoint_config['parameter_size']})"
+)
+st.sidebar.markdown(
+    f"**Hardware:** {endpoint_config['hw_label']} ({endpoint_config['chips']} Chips)"
+)
+st.sidebar.markdown(
+    f"**Peak Compute:** "
+    f"{endpoint_config['peak_tflops'] * endpoint_config['chips']:,} TFLOPs"
+)
+st.sidebar.markdown(
+    f"**Peak Mem BW:** "
+    f"{endpoint_config['peak_mem_bw'] * endpoint_config['chips']:.1f} TB/s"
+)
+
+st.sidebar.markdown("---")
+
+if st.sidebar.button("🗑️ Clear Chat History", use_container_width=True):
+    st.session_state.messages = []
+    st.session_state.session_metrics = []
+    st.rerun()
+
+st.sidebar.markdown(
+    "<br><br><br>"
+    "<small style='color:gray;'>Engineered with Google Cloud Accelerators</small>",
+    unsafe_allow_html=True,
+)
+
+# ── OpenAI-compatible client ───────────────────────────────────────
+client = OpenAI(
+    base_url=endpoint_config["url"],
+    api_key="not-needed",
+    timeout=600.0,
+)
+
+# ==========================================
+# Tabs
+# ==========================================
+tab_dashboard, tab_glossary = st.tabs(
+    ["🚀 Live Dashboard", "📖 Metrics Glossary & Math"]
+)
+
+# ══════════════════════════════════════════
+# TAB 1 — Live Dashboard
+# ══════════════════════════════════════════
+with tab_dashboard:
+    col_chat, col_dash = st.columns([1.5, 1.2])
+
+    # ──────────────────────────────────────
+    # LEFT COLUMN — Chat Interface
+    # ──────────────────────────────────────
+    with col_chat:
+        st.markdown(
+            "<div class='custom-header'>Accelerator Insights</div>",
+            unsafe_allow_html=True,
+        )
+
+        chat_container = st.container(height=520)
+
+        with chat_container:
+            for message in st.session_state.messages:
+                with st.chat_message(message["role"]):
+                    st.markdown(message["content"])
+
+        if prompt := st.chat_input(
+            "Ask a question…",
+            disabled=not is_healthy,
+        ):
+            # ── Build the full prompt (inject file context on first message) ──
+            if file_context and len(st.session_state.messages) == 0:
+                full_prompt = (
+                    f"Use the following document as context to answer the question.\n\n"
+                    f"--- DOCUMENT START ---\n{}\n--- DOCUMENT END ---\n\n"
+                    f"Question: {}"
+                )
+            else:
+                full_prompt = prompt
+
+            st.session_state.messages.append(
+                {"role": "user", "content": full_prompt}
+            )
+
+            # Enforce strict user/assistant alternation (OpenAI API requirement)
+            sanitized: list[dict] = []
+            for m in st.session_state.messages:
+                if not sanitized:
+                    if m["role"] == "user":
+                        sanitized.append(m)
+                else:
+                    if m["role"] != sanitized[-1]["role"]:
+                        sanitized.append(m)
+                    else:
+                        sanitized[-1] = m  # overwrite consecutive same-role msgs
+
+            st.session_state.messages = sanitized
+
+            # ── Render user bubble immediately ────────────────────────────
+            with chat_container:
+                with st.chat_message("user"):
+                    st.markdown(prompt)  # show the clean prompt, not the injected one
+
+                # ── Stream assistant response ─────────────────────────────
+                with st.chat_message("assistant"):
+                    message_placeholder = st.empty()
+                    full_response = ""
+                    start_time = time.time()
+                    ttft_sec = 0.0
+                    first_token_received = False
+                    input_tokens = 0
+                    output_tokens = 0
+                    error_occurred = False
+                    total_time_sec = 0.0
+                    decode_time_sec = 0.0
+
+                    try:
+                        response_stream = client.chat.completions.create(
+                            model=endpoint_config["model_name"],
+                            messages=st.session_state.messages,
+                            stream=True,
+                            stream_options={"include_usage": True},
+                        )
+
+                        for chunk in response_stream:
+                            # Capture time-to-first-token
+                            if (
+                                not first_token_received
+                                and chunk.choices
+                                and chunk.choices[0].delta.content
+                            ):
+                                ttft_sec = time.time() - start_time
+                                first_token_received = True
+
+                            if chunk.choices and chunk.choices[0].delta.content:
+                                full_response += chunk.choices[0].delta.content
+                                message_placeholder.markdown(full_response + "▌")
+
+                            # Token usage arrives in the final chunk
+                            if chunk.usage:
+                                input_tokens = chunk.usage.prompt_tokens
+                                output_tokens = chunk.usage.completion_tokens
+
+                        message_placeholder.markdown(full_response)
+
+                    except Exception as e:
+                        st.error(f"vLLM Generation Error: {}")
+                        error_occurred = True
+
+            # ── Post-inference: metrics & persistence ─────────────────────
+            if not error_occurred:
+                total_time_sec = time.time() - start_time
+                decode_time_sec = max(total_time_sec - ttft_sec, 0.0)
+
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": full_response}
+                )
+
+                tokens_sec, tpot_sec, tflops, mfu, mbu = calculate_derived_metrics(
+                    output_tokens=output_tokens,
+                    total_time_sec=total_time_sec,
+                    decode_time_sec=decode_time_sec,
+                    num_chips=endpoint_config["chips"],
+                    param_count=endpoint_config["parameter_count"],
+                    peak_tflops=endpoint_config["peak_tflops"],
+                    peak_mem_bw=endpoint_config["peak_mem_bw"],
+                )
+
+                hw_util = get_latest_hardware_utilization()
+                timestamp_dt = datetime.now(timezone.utc)
+
+                metric_record = {
+                    "query_timestamp": timestamp_dt,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "forward_time_sec": round(ttft_sec, 2),
+                    "decode_time_sec": round(decode_time_sec, 2),
+                    "total_time_sec": round(total_time_sec, 2),
+                    "tokens_per_sec": tokens_sec,
+                    "tpot_sec": tpot_sec,
+                    "tflops": tflops,
+                    "mfu_percent": mfu,
+                    "hw_utilization": hw_util,
+                    "mbu_percent": mbu,
+                    "model_name": endpoint_config["model_name"],
+                    "parameter_size": endpoint_config["parameter_size"],
+                }
+
+                st.session_state.session_metrics.append(metric_record)
+
+                success, save_err = save_metrics_to_bigquery(
+                    metric_record,
+                    endpoint_config["bq_table"],
+                    endpoint_config["util_column"],
+                )
+                if not success:
+                    st.toast(
+                        f"⚠️ Could not save to BigQuery: {}", icon="⚠️"
+                    )
+
+                st.rerun()
+
+    # ──────────────────────────────────────
+    # RIGHT COLUMN — Performance Dashboard
+    # ──────────────────────────────────────
+    with col_dash:
+        st.markdown(
+            "<div class='custom-header'>Performance Metrics</div>",
+            unsafe_allow_html=True,
+        )
+
+        dash_container = st.container(height=520)
+
+        with dash_container:
+
+            # ── Latest-query KPI cards ────────────────────────────────
+            if st.session_state.session_metrics:
+                st.markdown("### Latest Query")
+                latest = st.session_state.session_metrics[-1]
+
+                t1, t2, t3 = st.columns(3)
+                t1.metric(
+                    "TTFT",
+                    f"{latest['forward_time_sec']:.2f} s",
+                    help="Time to First Token — includes prefill latency.",
+                )
+                t2.metric(
+                    "TPOT",
+                    f"{latest['tpot_sec']:.3f} s",
+                    help="Time Per Output Token — average decode step latency.",
+                )
+                t3.metric(
+                    "Total Time",
+                    f"{latest['total_time_sec']:.2f} s",
+                    help="End-to-end request duration.",
+                )
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric(
+                    "Tokens/Sec",
+                    f"{latest['tokens_per_sec']:.1f} t/s",
+                    help="Overall decode throughput.",
+                )
+                m2.metric(
+                    "MFU",
+                    f"{latest['mfu_percent']:.1f} %",
+                    help="Model FLOPs Utilisation — fraction of peak compute used.",
+                )
+                m3.metric(
+                    "MBU",
+                    f"{latest['mbu_percent']:.1f} %",
+                    help="Memory Bandwidth Utilisation.",
+                )
+
+                tok1, tok2 = st.columns(2)
+                tok1.metric("Input Tokens", f"{latest['input_tokens']:,}")
+                tok2.metric("Output Tokens", f"{latest['output_tokens']:,}")
+
+                st.markdown("---")
+
+            # ── Historical trend controls ─────────────────────────────
+            st.markdown("### Historical Trends")
+
+            time_filter = st.selectbox(
+                "Timeframe",
+                [
+                    "Last 5 Minutes",
+                    "Last 1 Hour",
+                    "Last 24 Hours",
+                    "Last 7 Days",
+                    "Last 30 Days",
+                    "Custom Range",
+                ],
+                index=0,
+                label_visibility="collapsed",
+            )
+
+            custom_start, custom_end = None, None
+            if time_filter == "Custom Range":
+                c1, c2 = st.columns(2)
+                custom_start = c1.date_input(
+                    "Start Date", value=datetime.today() - timedelta(days=7)
+                )
+                custom_end = c2.date_input("End Date", value=datetime.today())
+
+            bq_data, fetch_error = get_filtered_history(
+                time_filter, endpoint_config, custom_start, custom_end
+            )
+
+            if fetch_error:
+                st.warning(f"Could not load database history: {}")
+
+            # ── Merge BQ + session data ───────────────────────────────
+            df = build_metrics_dataframe(
+                bq_data,
+                st.session_state.session_metrics,
+                endpoint_config["util_column"],
+                endpoint_config["util_label"],
+            )
+
+            if df.empty:
+                st.info(
+                    "No metrics found for this timeframe. "
+                    "Send a message to start recording data."
+                )
+            else:
+                util_label = endpoint_config["util_label"]
+                color_split = "Params" if "Params" in df.columns else None
+
+                # Timing & Latency
+                fig_timing = plot_custom_chart(
+                    df,
+                    ["TTFT (s)", "TPOT (s)", "Total (s)"],
+                    "Timing & Latency",
+                    "line",
+                    "Seconds",
+                )
+                st.plotly_chart(fig_timing, use_container_width=True)
+
+                # Throughput
+                fig_tps = plot_custom_chart(
+                    df,
+                    ["Tokens/Sec"],
+                    "Throughput",
+                    "area",
+                    "Tokens / Sec",
+                    color_col=color_split,
+                )
+                st.plotly_chart(fig_tps, use_container_width=True)
+
+                # Token Volume
+                fig_tokens = plot_custom_chart(
+                    df,
+                    ["Input Tokens", "Output Tokens"],
+                    "Token Volume",
+                    "bar",
+                    "Tokens",
+                )
+                st.plotly_chart(fig_tokens, use_container_width=True)
+
+                # Hardware Utilisation
+                fig_hw = plot_custom_chart(
+                    df,
+                    ["MFU (%)", "MBU (%)", util_label],
+                    "Hardware Utilisation",
+                    "line",
+                    "Percent (%)",
+                )
+                st.plotly_chart(fig_hw, use_container_width=True)
+
+                # Compute Performance
+                fig_flops = plot_custom_chart(
+                    df,
+                    ["TFLOPs"],
+                    "Compute Performance",
+                    "area",
+                    "TFLOPs",
+                    color_col=color_split,
+                )
+                st.plotly_chart(fig_flops, use_container_width=True)
+
+                # ── Query log table ───────────────────────────────────
+                st.subheader("Query Log")
+
+                log_cols = [
+                    "query_timestamp",
+                    "Model",
+                    "Params",
+                    "Input Tokens",
+                    "Output Tokens",
+                    "TTFT (s)",
+                    "TPOT (s)",
+                    "Total (s)",
+                    "Tokens/Sec",
+                    "TFLOPs",
+                    "MFU (%)",
+                    "MBU (%)",
+                    util_label,
+                ]
+
+                # Only keep columns that actually exist in the df
+                log_cols = [c for c in log_cols if c in df.columns]
+                display_df = df[log_cols].copy()
+
+                display_df["query_timestamp"] = display_df[
+                    "query_timestamp"
+                ].dt.strftime("%Y-%m-%d %H:%M:%S")
+                display_df.rename(
+                    columns={"query_timestamp": "Timestamp (EST)"}, inplace=True
+                )
+                display_df = display_df.set_index("Timestamp (EST)")
+
+                # Build format dict only for columns that exist
+                fmt = {}
+                fmt_map = {
+                    "TTFT (s)": "{:.2f}",
+                    "TPOT (s)": "{:.3f}",
+                    "Total (s)": "{:.2f}",
+                    "Tokens/Sec": "{:.2f}",
+                    "TFLOPs": "{:.2f}",
+                    "MFU (%)": "{:.2f}",
+                    "MBU (%)": "{:.2f}",
+                    util_label: "{:.2f}",
+                }
+                for col, fmt_str in fmt_map.items():
+                    if col in display_df.columns:
+                        fmt[col] = fmt_str
+
+                # Build gradient subset only for columns that exist
+                gradient_cols = [
+                    c for c in ["Tokens/Sec", "TFLOPs"] if c in display_df.columns
+                ]
+
+                styled_df = display_df.style
+                if gradient_cols:
+                    styled_df = styled_df.background_gradient(
+                        cmap="Blues", subset=gradient_cols
+                    )
+                styled_df = styled_df.format(fmt)
+
+                st.dataframe(styled_df, use_container_width=True)
+
+# ══════════════════════════════════════════
+# TAB 2 — Metrics Glossary
+# ══════════════════════════════════════════
+with tab_glossary:
+    st.title("📖 Inference Metrics Glossary")
+    st.markdown(
+        "A reference for every metric captured by this dashboard — "
+        "including the exact formula used to compute it."
+    )
+
+    st.markdown("---")
+
+    # ── Timing ────────────────────────────────────────────────────
+    st.subheader("⏱️ Timing & Latency Metrics")
+
+    st.markdown(
+        """
+**TTFT — Time to First Token**
+- **Unit:** Seconds (s)
+- **Description:** Time from prompt submission until the very first token is
+  returned. Covers network round-trip, API queueing, and the full *prefill*
+  forward pass over the prompt tokens.
+- **Formula:**
+"""
+    )
+    st.latex(r"\text{} = t_{\text{first token}} - t_{\text{request start}}")
+
+    st.markdown(
+        """
+**TPOT — Time Per Output Token**
+- **Unit:** Seconds / Token (s / token)
+- **Description:** Average time to generate each successive token *after* the
+  first. Characterises the speed of the autoregressive *decode* phase.
+- **Formula:**
+"""
+    )
+    st.latex(
+        r"\text{TPOT} = "
+        r"\frac{\text{Total Time} - \text{}}{\text{Output Tokens}}"
+    )
+
+    st.markdown(
+        """
+**Total Time**
+- **Unit:** Seconds (s)
+- **Description:** End-to-end wall-clock duration from request submission to
+  the final generated token.
+- **Formula:**
+"""
+    )
+    st.latex(r"\text{Total Time} = t_{\text{final token}} - t_{\text{request start}}")
+
+    st.markdown("---")
+
+    # ── Throughput & Compute ───────────────────────────────────────
+    st.subheader("🚀 Throughput & Compute Metrics")
+
+    st.markdown(
+        """
+**Tokens / Sec — Throughput**
+- **Unit:** Tokens per second (t/s)
+- **Description:** Overall generation rate across the full request.
+- **Formula:**
+"""
+    )
+    st.latex(
+        r"\text{Tokens/Sec} = "
+        r"\frac{\text{Output Tokens}}{\text{Total Time}}"
+    )
+
+    st.markdown(
+        """
+**TFLOPs — Tera Floating-Point Operations per Second**
+- **Unit:** TFLOPs
+- **Description:** Estimated compute throughput used during generation.
+  Assumes 2 FLOPs per parameter per token (1 multiply + 1 accumulate in
+  bfloat16 matrix multiplication).
+- **Formula:**
+"""
+    )
+    st.latex(
+        r"\text{} = "
+        r"\frac{2 \times \text{Parameter Count} \times \text{Tokens/Sec}}{10^{}}"
+    )
+
+    st.markdown("---")
+
+    # ── Hardware Utilisation ───────────────────────────────────────
+    st.subheader("⚙️ Hardware Utilisation Metrics")
+
+    st.markdown(
+        """
+**MFU — Model FLOPs Utilisation**
+- **Unit:** Percent (%)
+- **Description:** Fraction of the accelerator's theoretical peak compute
+  capacity actually consumed by the model. A higher MFU means the hardware
+  is being used more efficiently.
+- **Formula:**
+"""
+    )
+    st.latex(
+        r"\text{MFU} = "
+        r"\frac{\text{Achieved TFLOPs}}{\text{Peak TFLOPs per Chip} "
+        r"\times \text{Chip Count}} \times 100"
+    )
+
+    st.markdown(
+        """
+**MBU — Memory Bandwidth Utilisation**
+- **Unit:** Percent (%)
+- **Description:** Fraction of the HBM peak bandwidth consumed during the
+  decode phase. Computed assuming bfloat16 precision (2 bytes per parameter).
+  During decode the bottleneck is typically memory bandwidth, not compute.
+- **Formula:**
+"""
+    )
+    st.latex(
+        r"\text{MBU} = "
+        r"\frac{\text{Parameter Count} \times 2\ \text{bytes} "
+        r"\times \text{Decode Tokens/Sec}}"
+        r"{\text{Peak Mem BW per Chip (TB/s)} \times \text{Chip Count} "
+        r"\times 10^{}} \times 100"
+    )
+
+    st.markdown(
+        """
+**MXU (%) / SM Util (%)**
+- **Unit:** Percent (%)
+- **Description:** A *live hardware-level* signal pulled from Google Cloud
+  Monitoring
+  (`kubernetes.io/container/accelerator/duty_cycle`).
+
+  - **TPU (MXU %)** — physical active duty-cycle of the Matrix Multiply Units
+    inside each Trillium v6e chip.
+  - **GPU (SM Util %)** — fraction of time at least one warp was active on
+    a CUDA Streaming Multiprocessor.
+
+  Unlike MFU, which is mathematically derived from token counts, this metric
+  is measured directly by the hardware and reported every 60 s by GKE.
+"""
+    )
+
+    st.markdown("---")
+
+    # ── Quick reference table ──────────────────────────────────────
+    st.subheader("📋 Quick Reference")
+
+    ref_data = {
+        "Metric": [
+            "TTFT", "TPOT", "Total Time",
+            "Tokens/Sec", "TFLOPs",
+            "MFU", "MBU", "MXU / SM Util",
+        ],
+        "Unit": [
+            "s", "s/token", "s",
+            "t/s", "TFLOPs",
+            "%", "%", "%",
+        ],
+        "Source": [
+            "Derived (streaming timer)",
+            "Derived (streaming timer)",
+            "Derived (streaming timer)",
+            "Derived",
+            "Derived",
+            "Derived",
+            "Derived",
+            "Cloud Monitoring (live)",
+        ],
+        "Lower is Better": [
+            "✅", "✅", "✅",
+            "❌ (higher = better)",
+            "❌ (higher = better)",
+            "❌ (higher = better)",
+            "❌ (higher = better)",
+            "❌ (higher = better)",
+        ],
+    }
+
+    st.dataframe(pd.DataFrame(ref_data), use_container_width=True, hide_index=True)

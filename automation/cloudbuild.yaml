@@ -1,0 +1,37 @@
+steps:
+  # 1. Install dependencies
+  - name: 'python:3.10-slim'
+    dir: 'automation'
+    entrypoint: 'pip'
+    args: ['install', '-r', 'requirements.txt', '--user']
+
+  # 2. Run the inference load test
+  - name: 'python:3.10-slim'
+    dir: 'automation'
+    entrypoint: 'python'
+    args: ['run_batch_inference.py']
+    env:
+      - 'VLLM_API_URL=http://${_VLLM_IP}:8000/v1'
+
+  # 3. Wait slightly to ensure metrics fully flush to GCP Monitoring
+  - name: 'ubuntu'
+    entrypoint: 'sleep'
+    args: ['60']
+
+  # 4. Generate the performance report
+  - name: 'python:3.10-slim'
+    dir: 'automation'
+    entrypoint: 'python'
+    args: ['generate_final_report.py']
+    env:
+      - 'PROJECT_ID=${PROJECT_ID}'
+      - 'CLUSTER_NAME=${_CLUSTER_NAME}'
+      - 'VLLM_METRICS_URL=http://${_VLLM_IP}:8000/metrics'
+
+artifacts:
+  objects:
+    location: 'gs://${_GCS_BUCKET}/gemma3-vruns/$BUILD_ID/'
+    paths: ['automation/gemma3_v6e_final_report.json']
+
+options:
+  logging: CLOUD_LOGGING_ONLY

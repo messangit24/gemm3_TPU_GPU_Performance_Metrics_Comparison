@@ -1,0 +1,29 @@
+import time
+from openai import OpenAI
+import concurrent.futures
+
+def run_load_test(vllm_api_url, model_name, prompt, num_requests, concurrent_workers=10):
+    client = OpenAI(base_url=vllm_api_url, api_key="not-needed")
+    
+    def send_request(req_id):
+        start_time = time.time()
+        try:
+            client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=256
+            )
+        except Exception as e:
+            print(f"Request {req_id} failed: {e}")
+        return time.time() - start_time
+
+    print(f"Starting load test with {num_requests} requests...")
+    start_time = time.time()
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrent_workers) as executor:
+        # Execute the requests concurrently
+        list(executor.map(send_request, range(num_requests)))
+        
+    total_duration = time.time() - start_time
+    print(f"Load test finished in {total_duration:.2f} seconds.")
+    return total_duration
